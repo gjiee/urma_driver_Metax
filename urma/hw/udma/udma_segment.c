@@ -455,19 +455,21 @@ static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct ud
 	int prot = IOMMU_WRITE | IOMMU_READ;
 	bool dirty = false;
 	int ret = 0;
-
+	//这个函数，要通过 GPU，然后让GPU pin住虚拟地址
+	//无法直接用 VMA 找到 MM，而是需要 GPU 的 ABI，构造出 SG_TABLE
 	ret = udma_pin_seg_pages(ub_dev, ctx, seg, cfg, &prot);
 	if (unlikely(ret))
 		return ret;
 
 	if (!local_only) {
+		//此函数，需要额外的转化，将 GPU 的物理地址转换为 BAR 地址，至少是 UMMU 可寻址
 		ret = udma_ioummu_remote_map(tid, seg, prot);
 		if (unlikely(ret)) {
 			dev_err(ctx->dev->dev, "ioummu remote map failed, ret = %d.\n", ret);
 			goto err_ioummu_remote_map;
 		}
 	}
-
+	//此函数，需要额外的转换，将 GPU 的物理地址转换为 BAR 地址，至少是 DECODER 可寻址
 	ret = udma_iommu_local_map(ub_dev, ctx, seg, cfg, prot);
 	if (unlikely(ret)) {
 		dirty = true;
