@@ -11,6 +11,7 @@
 #include "udma_eid.h"
 #include "udma_tid.h"
 #include "udma_segment.h"
+#include "udma_gpu_p2p.h"
 
 static int udma_align_segment(struct udma_segment *seg)
 {
@@ -79,6 +80,7 @@ static void udma_init_seg_cfg(struct udma_segment *seg, struct ubcore_seg_cfg *c
 	seg->token_value_valid = cfg->flag.bs.token_policy != UBCORE_TOKEN_NONE;
 	seg->addr = cfg->va;
 	seg->length = cfg->len;
+	seg->is_gpu_seg = udma_seg_cfg_is_gpu(cfg);
 }
 
 static int udma_u_get_seg_perm(struct ubcore_seg_cfg *cfg)
@@ -320,6 +322,11 @@ static void udma_unpin_seg_pages(struct udma_segment *seg, bool dirty)
 	if (seg == NULL)
 		return;
 
+	if (udma_seg_is_gpu(seg)) {
+		udma_gpu_unpin_seg_pages(seg);
+		return;
+	}
+
 	if (seg->umem->va)
 		udma_umem_release(seg->umem, seg->kernel_mode, dirty);
 	else
@@ -455,8 +462,18 @@ static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct ud
 	int prot = IOMMU_WRITE | IOMMU_READ;
 	bool dirty = false;
 	int ret = 0;
-	//这个函数，要通过 GPU，然后让GPU pin住虚拟地址
-	//无法直接用 VMA 找到 MM，而是需要 GPU 的 ABI，构造出 SG_TABLE
+
+	if (udma_seg_cfg_is_gpu(cfg)) {
+		ret = udma_gpu_pin_seg_pages(to_udma_dev(ub_dev), seg, cfg);
+		if (unlikely(ret))
+			return ret;
+
+		dev_info(ctx->dev->dev,
+			 "GPU P2P bypass: skip udma_ioummu_remote_map / udma_iommu_local_map "
+			 "(IOMMU/UMMU GPU PA registration not implemented in Phase-0)\n");
+		return 0;
+	}
+
 	ret = udma_pin_seg_pages(ub_dev, ctx, seg, cfg, &prot);
 	if (unlikely(ret))
 		return ret;
@@ -550,8 +567,12 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 	}
 
 	if (!cfg->flag.bs.non_pin) {
-		ret = udma_pin_segment(ub_dev, cfg, seg,
-				       !!(cfg->flag.bs.access & UBCORE_ACCESS_WRITE));
+		if (udma_seg_cfg_is_gpu(cfg)) {
+			ret = udma_gpu_pin_seg_pages(udma_dev, seg, cfg);
+		} else {
+			ret = udma_pin_segment(ub_dev, cfg, seg,
+					       !!(cfg->flag.bs.access & UBCORE_ACCESS_WRITE));
+		}
 		if (ret) {
 			dev_err(udma_dev->dev, "pin segment failed, ret = %d.\n", ret);
 			goto err_pin_seg;
