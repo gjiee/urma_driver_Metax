@@ -10,3 +10,22 @@ config UB_UDMA
 	  in Hisilicon SoC. To compile this driver,
 	  choose Y here: if UB_UDMA is m, this module
 	  will be called udma.
+
+config UB_UDMA_NV_P2P
+	bool "UDMA NVIDIA GPU P2P segment registration (Scheme A)"
+	depends on UB_UDMA
+	default n
+	help
+	  Link udma.ko against nvidia.ko P2P exports. When
+	  UBCORE_REG_SEG_GPU_VA is set in register_seg flag,
+	  pin GPU VA via nvidia_p2p_get_pages_persistent and
+	  build sg_table using physical_address as DMA address.
+
+config UB_UDMA_GPU_P2P_DEBUG
+	bool "UDMA GPU P2P debug DMA inject and printk verification"
+	depends on UB_UDMA_NV_P2P
+	default y
+	help
+	  Inject sg_dma_address into kernel post_send WQE build path
+	  and printk DEADBEEF-tagged verification on register and
+	  first post_wr for GPU segments.

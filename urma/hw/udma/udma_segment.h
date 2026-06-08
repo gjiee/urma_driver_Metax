@@ -4,7 +4,21 @@
 #ifndef __UDMA_SEGMENT_H__
 #define __UDMA_SEGMENT_H__
 
+#include <linux/atomic.h>
 #include "udma_dev.h"
+
+#ifdef CONFIG_UB_UDMA_NV_P2P
+struct nvidia_p2p_page_table;
+
+struct udma_gpu_p2p_mem {
+	struct nvidia_p2p_page_table *page_table;
+	uint64_t gpu_va;
+	uint64_t mapped_size;
+	uint32_t page_size;
+	atomic_t reg_test_done;
+	atomic_t wr_test_done;
+};
+#endif
 
 struct udma_segment {
 	struct ubcore_target_seg core_tseg;
@@ -13,9 +27,13 @@ struct udma_segment {
 	uint32_t token_value;
 	bool token_value_valid;
 	bool kernel_mode;
+	bool is_gpu_seg;
 	uint32_t tid;
 	uint64_t addr;
 	uint64_t length;
+#ifdef CONFIG_UB_UDMA_NV_P2P
+	struct udma_gpu_p2p_mem gpu;
+#endif
 };
 
 static inline struct udma_segment *to_udma_seg(struct ubcore_target_seg *seg)
