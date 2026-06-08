@@ -19,8 +19,6 @@
 #include "udma_segment.h"
 #include "udma_jfc.h"
 #include "udma_jfs.h"
-#include "udma_gpu_p2p.h"
-#include "udma_gpu_p2p_debug.h"
 
 static bool udma_check_vma(struct udma_dev *dev, struct vm_area_struct *vma)
 {
@@ -1101,45 +1099,21 @@ udma_fill_sw_sge(struct udma_dev *dev, struct udma_sqe_ctl *sqe_ctl,
 		sqe_ctl->inline_msg_len = total_len;
 	} else if (wr->opcode != UBCORE_OPC_WRITE_ATOMIC) {
 		for (i = 0; i < num_sge; i++) {
-			uint64_t wqe_va = sge_info[i].addr;
-
 			if (sge_info[i].len == 0)
 				continue;
-#ifdef CONFIG_UB_UDMA_GPU_P2P_DEBUG
-			if (sge_info[i].tseg) {
-				struct udma_segment *useg = to_udma_seg(sge_info[i].tseg);
-
-				if (udma_seg_is_gpu(useg))
-					wqe_va = udma_gpu_p2p_debug_resolve_sge(dev, useg,
-										sge_info[i].addr,
-										sge_info[i].len);
-			}
-#endif
-			sge->va = wqe_va;
+			sge->va = sge_info[i].addr;
 			sge->length = sge_info[i].len;
 			sge++;
 			sge_num++;
 		}
 		sqe_ctl->sge_num = sge_num;
 	} else {
-		uint64_t atomic_va = sge_info[0].addr;
-
 		if (sge_info[0].len > SQE_CTL_ATOMICADD_LEN_BIT) {
 			dev_err(dev->dev, "local payload length overflow.\n");
 			return -EINVAL;
 		}
-#ifdef CONFIG_UB_UDMA_GPU_P2P_DEBUG
-		if (sge_info[0].tseg) {
-			struct udma_segment *useg = to_udma_seg(sge_info[0].tseg);
-
-			if (udma_seg_is_gpu(useg))
-				atomic_va = udma_gpu_p2p_debug_resolve_sge(dev, useg,
-									   sge_info[0].addr,
-									   sge_info[0].len);
-		}
-#endif
 		memcpy((void *)sqe_ctl + SQE_WRITE_ATOMICADD_DATA_ADDR_FIELD,
-			&atomic_va, sizeof(uint64_t));
+			&sge_info[0].addr, sizeof(uint64_t));
 		sqe_ctl->sge_num = sge_info[0].len & SQE_CTL_ATOMICADD_LEN_L_BIT;
 		sqe_ctl->write_len = (sge_info[0].len & SQE_CTL_ATOMICADD_LEN_H_BIT) >>
 					WRITE_ATOMICADD_LEN_H_OFFSET;
@@ -1208,20 +1182,10 @@ udma_k_fill_write_sqe(struct udma_dev *dev, struct udma_sqe_ctl *sqe_ctl,
 	sqe_ctl->rmt_obj_id = udma_seg->tid;
 	sqe_ctl->token_en = udma_seg->token_value_valid;
 	sqe_ctl->rmt_token_value = udma_seg->token_value;
-	{
-		uint64_t rmt_va = sge_info[0].addr;
-
-#ifdef CONFIG_UB_UDMA_GPU_P2P_DEBUG
-		if (udma_seg_is_gpu(udma_seg))
-			rmt_va = udma_gpu_p2p_debug_resolve_sge(dev, udma_seg,
-								sge_info[0].addr,
-								sge_info[0].len);
-#endif
-		sqe_ctl->rmt_addr_l_or_token_id = rmt_va & (uint32_t)SQE_CTL_RMA_ADDR_BIT;
-		sqe_ctl->rmt_addr_h_or_token_value =
-			(rmt_va >> (uint32_t)SQE_CTL_RMA_ADDR_OFFSET) &
+	sqe_ctl->rmt_addr_l_or_token_id = sge_info[0].addr & (uint32_t)SQE_CTL_RMA_ADDR_BIT;
+	sqe_ctl->rmt_addr_h_or_token_value =
+			(sge_info[0].addr >> (uint32_t)SQE_CTL_RMA_ADDR_OFFSET) &
 			(uint32_t)SQE_CTL_RMA_ADDR_BIT;
-	}
 
 	if (sqe_ctl->opcode == UDMA_OPC_WRITE_WITH_IMM) {
 		memcpy((void *)sqe_ctl + SQE_WRITE_IMM_FIELD, &wr->rw.notify_data,
@@ -1538,11 +1502,6 @@ static int udma_post_one_wr(struct udma_jetty_queue *sq, struct ubcore_jfs_wr *w
 			     opcode, udma_dev);
 	if (ret)
 		return ret;
-
-#ifdef CONFIG_UB_UDMA_GPU_P2P_DEBUG
-	udma_gpu_p2p_debug_post_wr(udma_dev, wr,
-				   (struct udma_sqe_ctl *)(void *)tmp_sq);
-#endif
 
 	wqebb_cnt = get_wqebb_num((struct udma_sqe_ctl *)(void *)tmp_sq);
 	if (wqebb_cnt == 1 && !!(udma_dev->caps.feature & UDMA_CAP_FEATURE_DIRECT_WQE))

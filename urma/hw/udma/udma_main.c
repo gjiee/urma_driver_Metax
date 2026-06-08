@@ -1660,9 +1660,6 @@ module_init(udma_init);
 module_exit(udma_exit);
 MODULE_VERSION(UDMA_DRV_VER);
 MODULE_LICENSE("GPL");
-#ifdef CONFIG_UB_UDMA_NV_P2P
-MODULE_SOFTDEP("pre: nvidia");
-#endif
 
 module_param(dev_name_style, bool, 0644);
 MODULE_PARM_DESC(dev_name_style, "Set device name style, default: 0(0:disable, 1:enable)");
