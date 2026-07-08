@@ -219,6 +219,29 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 		goto err_free_umem;
 	}
 
+	dev_info(dev->dev,
+		 "[GPU-TRACE] NV pin + SG build OK: gpu_va=0x%llx mapped_size=0x%llx "
+		 "entries=%u first_pa=0x%llx\n",
+		 gpu_va, mapped_size, page_table->entries,
+		 (uint64_t)sg_dma_address(seg->umem->append.sgt.sgl));
+
+	/*
+	 * GPU兼容测试补丁 — 一次性流程验证开关。
+	 * 改成 1：NV pin + 本地 SG 构建成功后立刻打印上面那行，然后主动报错
+	 * 结束流程（不再往下走 seg->is_gpu_seg=true / UMMU matt_map），方便
+	 * 先单独验证"内核识别 GPU VA → 调 NV → 建 SG 表"这一段能不能跑通，
+	 * 不受后面 UMMU 建表是否成功影响。验证完改回 0（或删掉这块 #if）
+	 * 即可恢复正常注册流程。
+	 */
+#define UDMA_GPU_P2P_TEST_STOP_AFTER_SG 0
+#if UDMA_GPU_P2P_TEST_STOP_AFTER_SG
+	dev_err(dev->dev,
+		"[GPU-TRACE] TEST STOP: UDMA_GPU_P2P_TEST_STOP_AFTER_SG=1, "
+		"aborting before UMMU map on purpose (set macro to 0 to continue)\n");
+	ret = -ECANCELED;
+	goto err_free_sgt;
+#endif
+
 	seg->gpu.page_table = page_table;
 	seg->gpu.gpu_va = gpu_va;
 	seg->gpu.mapped_size = mapped_size;
@@ -229,6 +252,10 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 
 	return 0;
 
+#if UDMA_GPU_P2P_TEST_STOP_AFTER_SG
+err_free_sgt:
+	sg_free_table(&seg->umem->append.sgt);
+#endif
 err_free_umem:
 	kfree(seg->umem);
 	seg->umem = NULL;
