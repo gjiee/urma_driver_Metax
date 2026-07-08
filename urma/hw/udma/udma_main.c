@@ -1691,14 +1691,16 @@ module_exit(udma_exit);
 MODULE_VERSION(UDMA_DRV_VER);
 MODULE_LICENSE("GPL");
 /*
- * GPU兼容测试补丁 — SP4: udma.ko 不直接链接 nvidia.ko，而是依赖
- * udma_nv_p2p_bridge.ko（Dual BSD/GPL，专门桥接 nvidia_p2p_* 符号）。
- * 真正的加载顺序是 nvidia.ko -> udma_nv_p2p_bridge.ko -> udma.ko，
- * 但 MODULE_SOFTDEP 只能声明直接依赖，nvidia 那一跳由
- * udma_nv_p2p_bridge.ko 自己的 softdep 负责。只有 modprobe 认 softdep，
- * insmod 需要手动保证顺序。
+ * GPU兼容测试补丁 — SP4: udma.ko 完全不依赖 nvidia.ko 或
+ * udma_nv_p2p_bridge.ko 才能加载——udma.ko 只是导出
+ * udma_register_gpu_p2p_ops()/udma_unregister_gpu_p2p_ops() 这两个普通
+ * GPL 符号，等 udma_nv_p2p_bridge.ko 后加载时反过来调用它们注册回调。
+ * 没有 bridge 也能正常 insmod，只是 GPU 段注册会返回 -ENODEV，
+ * 不影响其它 HOST 段功能。加载顺序变成:
+ *   nvidia.ko -> udma.ko -> udma_nv_p2p_bridge.ko
+ * （bridge 必须最后装；这里不需要也不应该声明 softdep，因为 udma.ko
+ * 本身没有"必须先有 bridge 才能加载"这个依赖关系）
  */
-MODULE_SOFTDEP("pre: udma_nv_p2p_bridge");
 
 module_param(dev_name_style, bool, 0444);
 MODULE_PARM_DESC(dev_name_style, "Set device name style, default: 1(0:disable, 1:enable)");

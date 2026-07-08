@@ -82,24 +82,29 @@ static inline bool udma_seg_ucmd_is_gpu(struct ubcore_udata *udata)
  *
  * nvidia_p2p_get_pages_persistent / nvidia_p2p_put_pages_persistent /
  * nvidia_p2p_build_sg_table_phys 在闭源驱动上 insmod 会报
- * "Unknown symbol ... (err -2)" —— 这三个符号在官方闭源驱动里根本不存在
- * (build_sg_table_phys 本来就是本项目在开源 fork 里自己加的；
- *  *_persistent 系列在你这版闭源驱动上同样未导出/不可用)。
+ * "Unknown symbol ... (err -2)"（build_sg_table_phys 本来就是本项目
+ * 在开源 fork 里自己加的，*_persistent 系列在闭源驱动上同样未导出）。
  *
- * 换成 NVIDIA 从最早期 GPUDirect RDMA 起就一直稳定导出、
- * nvidia-peermem.ko 用了十几年的经典 API（get_pages/put_pages）之后，
- * 依然 "Unknown symbol" —— 这次是因为 udma.ko 是纯 GPL，nvidia.ko 是
- * proprietary，跨这个边界的静态符号解析（GPL taint + CONFIG_MODVERSIONS
- * CRC 校验）不干净。
+ * 换成经典 get_pages/put_pages 之后依然 "Unknown symbol"——udma.ko
+ * 纯 GPL、nvidia.ko proprietary，跨这个边界的静态符号解析（GPL taint +
+ * CONFIG_MODVERSIONS CRC 校验）不干净。
  *
- * 修复: 参照传统 RDMA 厂商模式（Mellanox nvidia-peermem.ko 本身就是
- * MODULE_LICENSE("Dual BSD/GPL")，不是纯 GPL），单独切一个 Dual BSD/GPL
- * 的 udma_nv_p2p_bridge.ko 专门直接链接 nvidia.ko 的符号，udma.ko 只依赖
- * 这个我们自己完全掌控的桥接模块（见 udma_nv_p2p_bridge.h）。
+ * 单独切一个 Dual BSD/GPL 的 udma_nv_p2p_bridge.ko 直接链 nvidia.ko
+ * 符号（v1）也不够——inherit_taint() 会把 TAINT_PROPRIETARY_MODULE
+ * 无条件传给这个桥接模块（跟它自己声明什么 license 无关），udma.ko
+ * 再去静态链接**它**，撞上一模一样的墙。
  *
- * SG 表不再指望 NV 侧提供，直接在 udma_gpu_p2p.c 里用
+ * 最终修复（v2，见 udma_nv_p2p_bridge.h）: 反转控制方向。udma.ko 自己
+ * 导出两个普通 GPL 符号 udma_register_gpu_p2p_ops()/
+ * udma_unregister_gpu_p2p_ops()（本文件 .c 实现），udma_nv_p2p_bridge.ko
+ * 在自己 module_init() 时主动调用它们，把一组函数指针注册进来。
+ * udma.ko 后续调 NV P2P 全部走函数指针，不 import 任何 bridge/nvidia
+ * 符号——这正是 Mellanox ib_core.ko 与 nvidia-peermem.ko 之间的真实
+ * 关系（ib_register_peer_memory_client 模式）。
+ *
+ * SG 表不依赖 NV 侧任何符号，直接在 udma_gpu_p2p.c 里用
  * page_table->pages[i]->physical_address（公开稳定 ABI 字段）自己拼——
- * 这是纯结构体字段读取，不涉及符号链接，留在 udma.ko 里没有 license 问题。
+ * 这是纯结构体字段读取，不涉及符号链接。
  */
 
 //GPU兼容测试补丁: NVIDIA P2P 仅支持 64KB 页，与 NVIDIA_P2P_PAGE_SIZE_64KB 一致
@@ -146,8 +151,8 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 
 /*
  * GPU兼容测试补丁: 释放 GPU pin 与 SG
- * @seg: 必须 is_gpu_seg；调用 udma_nv_p2p_put_pages（经桥接模块转发到
- *       nvidia_p2p_put_pages）+ sg_free_table
+ * @seg: 必须 is_gpu_seg；通过已注册 provider 的 put_pages 函数指针
+ *       转发到 nvidia_p2p_put_pages，再 sg_free_table
  */
 void udma_gpu_unpin_seg_pages(struct udma_segment *seg);
 
