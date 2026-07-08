@@ -111,8 +111,9 @@ static inline void ipourma_build_tjetty_cfg(struct ubcore_tjetty_cfg *tjetty_cfg
 	tjetty_cfg->id.eid = *dst_eid;
 	tjetty_cfg->id.id = jetty_id;
 	tjetty_cfg->flag.bs.token_policy = UBCORE_TOKEN_NONE;
+	tjetty_cfg->flag.bs.order_type = ctp_en ? UBCORE_OL : UBCORE_DEF_ORDER;
 	tjetty_cfg->tp_type = ctp_en ? UBCORE_CTP : UBCORE_UTP;
-	tjetty_cfg->trans_mode = ctp_en ? UBCORE_TP_RM : UBCORE_TP_UM;
+	tjetty_cfg->trans_mode = UBCORE_TP_UM;
 	tjetty_cfg->type = UBCORE_JETTY;
 	tjetty_cfg->eid_index = eid_idx;
 }
@@ -127,8 +128,7 @@ static struct ubcore_tjetty *ipourma_import_jetty(struct net_device *dev,
 	struct ubcore_tjetty *tjetty;
 	uint32_t ctp_en;
 
-	ctp_en = urma_dev->attr.dev_cap.feature.bs.ctp_en;
-
+	ctp_en = priv->urma_dev->attr.dev_cap.feature.bs.ctp_en;
 	ipourma_build_tjetty_cfg(&tjetty_cfg, dst_eid, jetty_id, eid_index, ctp_en);
 	tjetty = ubcore_import_jetty(urma_dev, &tjetty_cfg, NULL);
 	if (IS_ERR_OR_NULL(tjetty)) {
@@ -373,7 +373,6 @@ static int ipourma_update_wr(struct net_device *dev, struct ipourma_tx_buf *tx_r
 			priv->runtime_stats.tx_stats.num_import_jetty_real++;
 			tjetty_new = ipourma_import_new_tjetty(priv, tx_req);
 			if (IS_ERR_OR_NULL(tjetty_new)) {
-				ipourma_advance_tx_tail(priv, tx_req);
 				priv->runtime_stats.tx_stats.import_jetty_failed++;
 				return IPOURMA_TJETTY_NODE_ALLOC_FAILED;
 			}
@@ -397,6 +396,9 @@ void ipourma_post_send(struct work_struct *work)
 	struct ipourma_dev_priv *priv = tx_req->priv;
 	int ret;
 	struct ubcore_jfs_wr *jfs_bad_wr = NULL;
+
+	if (!test_bit(IPOURMA_DEV_ADMIN_UP, &priv->flags))
+		return;
 
 	priv->runtime_stats.tx_stats.post_send_start++;
 	pr_debug("post_send start, idx %u, jetty %u\n", tx_req->idx, tx_req->eid_index);
@@ -455,10 +457,10 @@ int ipourma_check_skb(struct net_device *dev, struct sk_buff *skb)
 		/**
 		 *  the overall length of linear & nonlinear should not
 		 *  exceed the urma mtu when using send operation over CTP
-		 *  ubcore doesn't define a CTP mode, use UBCORE_TP_RM for now
+		 *  ubcore doesn't define a CTP mode, use UBCORE_TP_UM for now
 		 */
 		if ((priv->urma_op_mode == UBCORE_OPC_SEND) &&
-			(priv->urma_transport_mode == UBCORE_TP_RM)) {
+			(priv->urma_transport_mode == UBCORE_TP_UM)) {
 			priv->runtime_stats.tx_stats.packet_size_error++;
 			netdev_dbg(dev, "%s: skb len = %u\n",
 						ipourma_err_desc(IPOURMA_GIANT_PACKET),

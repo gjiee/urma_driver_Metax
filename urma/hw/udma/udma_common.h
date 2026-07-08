@@ -10,9 +10,11 @@
 #include "udma_ctx.h"
 #include "udma_dev.h"
 
+#define UDMA_WQE_LOCK_BUFFER_JETTY_IDX 4096
 #define TP_ACK_UDP_SPORT_H_OFFSET 8
 #define UDMA_TPHANDLE_TPID_SHIFT 0xFFFFFF
 #define UDMA_EID_GUID_INDEX_OFFSET 24
+#define UDMA_CCU_SQE_BB_CNT 2
 #define UDMA_MIN_SLEEP_TIME 100
 #define UDMA_REMOVE_MAX_SLEEP_TIME 800
 #define UDMA_OPEN_RX_MAX_SLEEP_TIME 3000
@@ -374,12 +376,6 @@ static inline void *get_buf_entry(struct udma_buf *buf, uint32_t n)
 	uint32_t entry_index = n & (buf->entry_cnt - 1);
 
 	return (char *)buf->kva + (entry_index * buf->entry_size);
-}
-
-static inline uint8_t to_ta_timeout(uint32_t err_timeout)
-{
-#define TA_TIMEOUT_DIVISOR 8
-	return err_timeout / TA_TIMEOUT_DIVISOR;
 }
 
 static inline uint64_t udma_cal_npages(uint64_t va, uint64_t len)

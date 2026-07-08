@@ -22,11 +22,14 @@
 #define UBAGG_MAX_PORT_NUM (9)
 #define ubagg_container_of(ptr, type, member) \
 	(((ptr) == NULL) ? NULL : container_of(ptr, type, member))
+#define UBAGG_COMM_PROTOCOL (1)
 
 enum ubagg_ht_param_num {
 	UBAGG_HT_SEGMENT_HT,
 	UBAGG_HT_JETTY_HT,
 	UBAGG_HT_JFR_HT,
+	UBAGG_HT_JFS_HT,
+	UBAGG_HT_JFC_HT,
 	UBAGG_HT_MAX,
 };
 
@@ -59,9 +62,7 @@ struct ubagg_seg_info {
 
 // must be consistent with urma_bond_seg_info_out_t
 struct ubagg_seg_exchange_info {
-	struct ubagg_seg_info base;
 	struct ubagg_seg_info slaves[UBAGG_DEV_MAX_NUM];
-	int dev_num;
 };
 
 struct ubagg_seg_hash_node {
@@ -81,7 +82,7 @@ struct ubagg_jetty_id {
 
 struct ubagg_jetty_exchange_info {
 	struct ubagg_jetty_id slaves[UBAGG_DEV_MAX_NUM];
-	bool is_multipath;
+	bool is_msn_enabled;
 	uint8_t enabled_indices[UBAGG_DEV_MAX_NUM];
 	uint32_t enabled_count;
 	bool is_health_check_enable;
@@ -108,10 +109,16 @@ struct ubagg_jfr_hash_node {
 
 struct ubagg_jfc {
 	struct ubcore_jfc base;
+	uint32_t token_id;
+	struct ubagg_jetty_id slaves[UBAGG_DEV_MAX_NUM];
+	struct hlist_node hnode;
 };
 
 struct ubagg_jfs {
 	struct ubcore_jfs base;
+	uint32_t token_id;
+	struct ubagg_jetty_id slaves[UBAGG_DEV_MAX_NUM];
+	struct hlist_node hnode;
 };
 
 struct ubagg_physical_device {
