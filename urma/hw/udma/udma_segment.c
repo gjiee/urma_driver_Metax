@@ -84,8 +84,9 @@ static void udma_init_seg_cfg(struct udma_segment *seg, struct ubcore_seg_cfg *c
 	seg->length = cfg->len;
 	/*
 	 * GPU兼容测试补丁 — 环节 4.1
-	 * 根据 cfg->flag.value bit15 标记 seg->is_gpu_seg
-	 * 后续 unpin / matt_map 据此分流
+	 * cfg->flag.value 的 GPU 标记位已在 udma_register_seg() 里根据
+	 * udata->udrv_data 打好（udma_seg_ucmd_is_gpu），这里只是读出来
+	 * 记到 seg->is_gpu_seg，后续 unpin / matt_map 据此分流
 	 */
 	seg->is_gpu_seg = udma_seg_cfg_is_gpu(cfg);
 }
@@ -609,6 +610,15 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 	struct udma_segment *seg;
 	struct iommu_sva *ksva;
 	int ret = 0;
+
+	/*
+	 * GPU兼容测试补丁: GPU 标记从 udata->udrv_data 私有通道读出，打到
+	 * 本地 cfg（= ubcore_register_seg 里的 tmp_cfg 局部拷贝）上。此时
+	 * ubcore_check_register_seg_para() 已经用未被修改的原始 flag 校验
+	 * 通过，这里打哪个 bit 都不会影响校验结果或用户可见的 seg.attr。
+	 */
+	if (udma_seg_ucmd_is_gpu(udata))
+		cfg->flag.value |= UBCORE_REG_SEG_GPU_VA;
 
 	ret = udma_check_seg_cfg(udma_dev, cfg);
 	if (ret)
