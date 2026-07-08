@@ -3,15 +3,36 @@
 /*
  * GPU兼容测试补丁 — SP4 (openEuler-24.03-LTS-SP4 同步版)
  *
- * 环节 5: GPU Pin + SG 构建（Scheme A）
- *   NV get_pages_persistent → build_sg_table_phys(PA → sg_dma_address)
- * 输出 sgt 供环节 7 ummu_sva_matt_map 使用；不返回用户态。
+ * 环节 5: GPU Pin + SG 构建（Scheme A，闭源 nvidia.ko 兼容版）
  *
- * 注意: nvidia_p2p_build_sg_table_phys 不是 NVIDIA 官方导出符号
- * (开源/闭源 nvidia.ko 都没有)，如果你链接的是官方驱动，
- * 把下面这行换成本文件内的本地实现（不依赖 NV 侧新增符号），
- * 只用官方稳定 ABI nvidia_p2p_get_pages_persistent +
- * struct nvidia_p2p_page_table/nvidia_p2p_page。
+ * 改动记录:
+ *   - nvidia_p2p_get_pages_persistent / put_pages_persistent /
+ *     nvidia_p2p_build_sg_table_phys 在闭源驱动上都 "Unknown symbol ...
+ *     (err -2)"。换成经典 nvidia_p2p_get_pages/put_pages/free_page_table
+ *     之后，同样报 Unknown symbol —— 尽管用 /proc/kallsyms 确认符号
+ *     确实存在于已加载的 nvidia.ko 里。
+ *   - 根因: udma.ko 是 MODULE_LICENSE("GPL")，nvidia.ko 是 proprietary。
+ *     直接让纯 GPL 模块静态链接 proprietary 模块的符号，insmod 阶段的
+ *     符号解析不干净。参照传统 RDMA 厂商的模式（Mellanox
+ *     nvidia-peermem.ko 就是 MODULE_LICENSE("Dual BSD/GPL")，不是纯
+ *     GPL）：单独切一个 Dual BSD/GPL 的小"桥接"模块
+ *     （udma_nv_p2p_bridge.ko）专门直接链接 nvidia.ko 的符号，udma.ko
+ *     只依赖这个我们自己完全掌控的桥接模块，不再直接碰 nvidia.ko。
+ *     本文件因此改为调用 udma_nv_p2p_bridge.h 里声明的 wrapper 函数。
+ *   - nvidia_p2p_build_sg_table_phys 根本不是官方符号（本项目自造），
+ *     闭源驱动同样没有，改成本文件内 udma_gpu_build_sg_table() 本地实现，
+ *     只用官方公开稳定字段 page_table->pages[i]->physical_address（纯
+ *     结构体字段读取，不涉及符号链接，留在 udma.ko 里没有 license 问题）。
+ *
+ * 当前阶段目标（TODO 标注处均是已知简化，先跑通 NV 函数交互）:
+ *   1. register_seg 能成功调用到 nvidia_p2p_get_pages（经桥接模块）
+ *      并拿到 page_table；
+ *   2. 本地拼出 sg_table，交给 UMMU 建表；
+ *   3. free_callback 只做最小处理（打日志 + free_page_table），
+ *      不做完整的向上层通知失效；这条路径在测试场景不会被触发
+ *      （只要 App 没有在 unregister_seg 之前 cudaFree），先放着。
+ *
+ * 加载顺序: nvidia.ko -> udma_nv_p2p_bridge.ko -> udma.ko
  */
 
 #define dev_fmt(fmt) "UDMA: " fmt
@@ -21,6 +42,7 @@
 #include <nv-p2p.h>
 
 #include "udma_gpu_p2p.h"
+#include "udma_nv_p2p_bridge.h"
 
 /*
  * GPU兼容测试补丁: 将用户 [va, va+len) 映射长度对齐到 64KB 边界
@@ -37,13 +59,89 @@ static uint64_t udma_gpu_align_len(uint64_t addr, uint64_t len)
 }
 
 /*
+ * GPU兼容测试补丁: 本地拼 sg_table，替代不存在的 nvidia_p2p_build_sg_table_phys
+ * @page_table: udma_nv_p2p_get_pages() 返回值，entries/pages[]/page_size 都是
+ *              官方 nv-p2p.h 公开字段，开源闭源驱动布局一致。这里只是读
+ *              结构体字段，不涉及任何符号链接，留在 udma.ko（GPL）里没有
+ *              license 问题。
+ * @sgt:        输出，sg_page=NULL（无 struct page，纯 PA），
+ *              sg_dma_address=GPU 物理地址，sg_dma_len=64KB
+ */
+static int udma_gpu_build_sg_table(struct nvidia_p2p_page_table *page_table,
+				   struct sg_table *sgt)
+{
+	struct scatterlist *sg;
+	uint64_t page_size = UDMA_GPU_P2P_PAGE_SIZE;
+	uint32_t i;
+	int ret;
+
+	if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB)
+		return -EINVAL;
+
+	ret = sg_alloc_table(sgt, page_table->entries, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	for_each_sg(sgt->sgl, sg, page_table->entries, i) {
+		sg_set_page(sg, NULL, page_size, 0);
+		sg_dma_address(sg) = page_table->pages[i]->physical_address;
+		sg_dma_len(sg) = page_size;
+	}
+
+	return 0;
+}
+
+/*
+ * GPU兼容测试补丁: nvidia_p2p_get_pages() 的 free_callback
+ * （经 udma_nv_p2p_bridge.ko 转发，见 udma_nv_p2p_get_pages()）
+ *
+ * 触发时机: GPU 内存在本段还没 unregister_seg 之前被 App 提前释放
+ * （例如 cudaFree 早于 urma_unregister_seg）。NV 驱动会异步调用这里，
+ * 调用之后 page_table 本身已经不可信，不能再对它做 udma_nv_p2p_put_pages()。
+ *
+ * TODO（当前测试补丁的已知简化）:
+ *   正确做法应该顺着 seg → ubcore_target_seg 往上通知 ubcore/上层这段已经
+ *   失效（类似 nvidia-peermem 的 invalidate_peer_memory 回调），让后续
+ *   WRITE/READ 直接报错而不是访问已释放的物理页。这里先只打印错误日志，
+ *   把 force_freed 置位防止 unpin 时重复 put_pages，其余先不处理——
+ *   只要测试流程严格 "register → 用 → unregister"，不提前 cudaFree，
+ *   这个回调就不会被触发，不影响先跑通 pin/unpin 主链路。
+ */
+static void udma_gpu_p2p_free_callback(void *data)
+{
+	struct udma_segment *seg = (struct udma_segment *)data;
+
+	if (!seg) {
+		pr_err("UDMA: GPU free_callback with NULL seg\n");
+		return;
+	}
+
+	pr_err("UDMA: GPU seg gpu_va=0x%llx force-freed by NVIDIA driver "
+	       "(App freed GPU memory before unregister_seg) — segment now stale, "
+	       "TODO: propagate invalidation to ubcore\n",
+	       seg->gpu.gpu_va);
+
+	seg->gpu.force_freed = true;
+
+	/*
+	 * 回调上下文里不能再调 udma_nv_p2p_put_pages()（page_table 已经在
+	 * NV 内部被清理，语义上等价于 nvidia-peermem.c 的
+	 * nv_get_p2p_free_callback 场景）。free_page_table 官方文档标注是
+	 * no-op，留着调用是为了跟第三方生态的既有习惯保持一致。
+	 */
+	udma_nv_p2p_free_page_table(seg->gpu.page_table);
+}
+
+/*
  * GPU兼容测试补丁 — 环节 5 主函数
  *
  * 调用链:
  *   udma_register_seg / udma_pin_pages_and_ioummu_map
  *     → udma_gpu_pin_seg_pages()
- *       → nvidia_p2p_get_pages_persistent(gpu_va, mapped_size, &page_table, 0)
- *       → nvidia_p2p_build_sg_table_phys(page_table, &seg->umem->append.sgt)
+ *       → udma_nv_p2p_get_pages(gpu_va, mapped_size, &page_table,
+ *                               udma_gpu_p2p_free_callback, seg)
+ *         [udma_nv_p2p_bridge.ko 转发到 nvidia_p2p_get_pages]
+ *       → udma_gpu_build_sg_table(page_table, &seg->umem->append.sgt)
  *
  * 参数说明:
  *   cfg->va:          用户传入的 CUDA GPU 虚拟地址
@@ -79,16 +177,16 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 	}
 
 	/*
-	 * GPU兼容测试补丁: 调用 NV 导出符号（开源/闭源 nvidia.ko 均导出）
-	 * 入参 gpu_va:     64KB 对齐 GPU 虚拟地址
-	 * 入参 mapped_size: 映射字节数（64KB 倍数）
-	 * 出参 page_table:  pinned 页表，注销时 put_pages_persistent
-	 * 入参 flags:      0
+	 * GPU兼容测试补丁: 经 udma_nv_p2p_bridge.ko 转发调 NV 经典 P2P API，
+	 * udma.ko 本身不直接静态链接 nvidia.ko 的任何符号。
+	 * free_callback: udma_gpu_p2p_free_callback，data 传 seg 本身
+	 *                方便回调里定位 gpu.page_table/gpu_va
 	 */
-	ret = nvidia_p2p_get_pages_persistent(gpu_va, mapped_size, &page_table, 0);
+	ret = udma_nv_p2p_get_pages(gpu_va, mapped_size, &page_table,
+				    udma_gpu_p2p_free_callback, seg);
 	if (ret) {
 		dev_err(dev->dev,
-			"nvidia_p2p_get_pages_persistent failed gpu_va=0x%llx len=0x%llx ret=%d\n",
+			"udma_nv_p2p_get_pages failed gpu_va=0x%llx len=0x%llx ret=%d\n",
 			gpu_va, mapped_size, ret);
 		return ret;
 	}
@@ -111,30 +209,58 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 	seg->umem->length = cfg->len;
 
 	/*
-	 * GPU兼容测试补丁: 将 NV page_table 转为 scatterlist
+	 * GPU兼容测试补丁: 本地拼 sg_table（不再依赖 NV 侧任何自造符号）
 	 * 每个 sg: dma_address = GPU 物理地址（非 CPU PFN）
 	 * 供 ummu_sva_matt_map(domain, gpu_va, sgt, prot) 消费
 	 */
-	ret = nvidia_p2p_build_sg_table_phys(page_table, &seg->umem->append.sgt);
+	ret = udma_gpu_build_sg_table(page_table, &seg->umem->append.sgt);
 	if (ret) {
-		dev_err(dev->dev, "nvidia_p2p_build_sg_table_phys failed ret=%d\n", ret);
+		dev_err(dev->dev, "udma_gpu_build_sg_table failed ret=%d\n", ret);
 		goto err_free_umem;
 	}
+
+	dev_info(dev->dev,
+		 "[GPU-TRACE] NV pin + SG build OK: gpu_va=0x%llx mapped_size=0x%llx "
+		 "entries=%u first_pa=0x%llx\n",
+		 gpu_va, mapped_size, page_table->entries,
+		 (uint64_t)sg_dma_address(seg->umem->append.sgt.sgl));
+
+	/*
+	 * GPU兼容测试补丁 — 一次性流程验证开关。
+	 * 改成 1：NV pin + 本地 SG 构建成功后立刻打印上面那行，然后主动报错
+	 * 结束流程（不再往下走 seg->is_gpu_seg=true / UMMU matt_map），方便
+	 * 先单独验证"内核识别 GPU VA → 调 NV → 建 SG 表"这一段能不能跑通，
+	 * 不受后面 UMMU 建表是否成功影响。验证完改回 0（或删掉这块 #if）
+	 * 即可恢复正常注册流程。
+	 */
+#define UDMA_GPU_P2P_TEST_STOP_AFTER_SG 0
+#if UDMA_GPU_P2P_TEST_STOP_AFTER_SG
+	dev_err(dev->dev,
+		"[GPU-TRACE] TEST STOP: UDMA_GPU_P2P_TEST_STOP_AFTER_SG=1, "
+		"aborting before UMMU map on purpose (set macro to 0 to continue)\n");
+	ret = -ECANCELED;
+	goto err_free_sgt;
+#endif
 
 	seg->gpu.page_table = page_table;
 	seg->gpu.gpu_va = gpu_va;
 	seg->gpu.mapped_size = mapped_size;
+	seg->gpu.force_freed = false;
 	seg->addr = gpu_va;
 	seg->length = mapped_size;
 	seg->is_gpu_seg = true;
 
 	return 0;
 
+#if UDMA_GPU_P2P_TEST_STOP_AFTER_SG
+err_free_sgt:
+	sg_free_table(&seg->umem->append.sgt);
+#endif
 err_free_umem:
 	kfree(seg->umem);
 	seg->umem = NULL;
 err_put_pages:
-	nvidia_p2p_put_pages_persistent(gpu_va, page_table, 0);
+	udma_nv_p2p_put_pages(gpu_va, page_table);
 	return ret;
 }
 
@@ -149,7 +275,12 @@ void udma_gpu_unpin_seg_pages(struct udma_segment *seg)
 		return;
 
 	if (seg->gpu.page_table) {
-		nvidia_p2p_put_pages_persistent(seg->gpu.gpu_va, seg->gpu.page_table, 0);
+		/*
+		 * force_freed==true 说明 free_callback 已经跑过一次，
+		 * page_table 在 NV 内部已经失效，不能再 put_pages。
+		 */
+		if (!seg->gpu.force_freed)
+			udma_nv_p2p_put_pages(seg->gpu.gpu_va, seg->gpu.page_table);
 		seg->gpu.page_table = NULL;
 	}
 

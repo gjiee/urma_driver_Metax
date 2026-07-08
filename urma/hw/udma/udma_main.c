@@ -1690,8 +1690,15 @@ module_init(udma_init);
 module_exit(udma_exit);
 MODULE_VERSION(UDMA_DRV_VER);
 MODULE_LICENSE("GPL");
-/* GPU兼容测试补丁 — SP4: 加载 udma.ko 前须先加载导出 P2P 符号的 nvidia.ko */
-MODULE_SOFTDEP("pre: nvidia");
+/*
+ * GPU兼容测试补丁 — SP4: udma.ko 不直接链接 nvidia.ko，而是依赖
+ * udma_nv_p2p_bridge.ko（Dual BSD/GPL，专门桥接 nvidia_p2p_* 符号）。
+ * 真正的加载顺序是 nvidia.ko -> udma_nv_p2p_bridge.ko -> udma.ko，
+ * 但 MODULE_SOFTDEP 只能声明直接依赖，nvidia 那一跳由
+ * udma_nv_p2p_bridge.ko 自己的 softdep 负责。只有 modprobe 认 softdep，
+ * insmod 需要手动保证顺序。
+ */
+MODULE_SOFTDEP("pre: udma_nv_p2p_bridge");
 
 module_param(dev_name_style, bool, 0444);
 MODULE_PARM_DESC(dev_name_style, "Set device name style, default: 1(0:disable, 1:enable)");

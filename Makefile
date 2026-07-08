@@ -29,6 +29,8 @@ modules:
 		exit 1; }
 	@test -f "$(NV_MODULE_SYMVERS)" || { \
 		echo "ERROR: Module.symvers not found: $(NV_MODULE_SYMVERS)"; \
+		echo "  Needed by udma_nv_p2p_bridge.ko, the Dual BSD/GPL bridge module"; \
+		echo "  that directly links nvidia.ko (udma.ko itself no longer does)."; \
 		echo "  Point NV_MODULE_SYMVERS at your nvidia.ko build's Module.symvers"; \
 		exit 1; }
 	mkdir -p $(BUILD_DIR)
