@@ -83,14 +83,14 @@ udma_ioummu_remote_map / udma_iommu_local_map
 | 文件 | 作用 |
 |------|------|
 | `urma/hw/udma/udma_gpu_p2p.h` | `struct udma_register_seg_ucmd`（wire 格式）、`udma_seg_ucmd_is_gpu()`（从 udrv_data 解析）、`udma_seg_cfg_is_gpu()`（内部判定）、内部私有位 `UBCORE_REG_SEG_GPU_VA` |
-| `urma/hw/udma/udma_gpu_p2p.c` | GPU pin/unpin 主逻辑 + 本地 SG 构建；调用 `udma_nv_p2p_bridge.ko` 的 wrapper，不直接碰 `nvidia_p2p_*` |
-| `urma/hw/udma/udma_nv_p2p_bridge.h` | 桥接模块对外暴露的 wrapper 函数声明（`udma_nv_p2p_get_pages`/`put_pages`/`free_page_table`） |
-| `urma/hw/udma/udma_nv_p2p_bridge.c` | **独立 `.ko`**，`MODULE_LICENSE("Dual BSD/GPL")`，直接静态链接 `nvidia.ko`，`EXPORT_SYMBOL` 自己的 wrapper |
+| `urma/hw/udma/udma_gpu_p2p.c` | GPU pin/unpin 主逻辑 + 本地 SG 构建；**导出** `udma_register_gpu_p2p_ops()`/`udma_unregister_gpu_p2p_ops()`（普通 GPL 符号），调 NV P2P 全部走已注册 provider 的函数指针，不 import 任何 bridge/nvidia 符号 |
+| `urma/hw/udma/udma_nv_p2p_bridge.h` | `struct udma_gpu_p2p_ops`（函数指针契约）+ 两个注册接口声明 |
+| `urma/hw/udma/udma_nv_p2p_bridge.c` | **独立 `.ko`**，`MODULE_LICENSE("Dual BSD/GPL")`，直接静态链接 `nvidia.ko`；**不 `EXPORT_SYMBOL` 任何东西**，`module_init()` 里反过来调 `udma_register_gpu_p2p_ops()` 注册回调 |
 | `urma/hw/udma/udma_segment.h` | GPU 段结构体扩展（`is_gpu_seg`、`struct udma_gpu_p2p_mem gpu`） |
 | `urma/hw/udma/udma_segment.c` | `udma_register_seg()` 入口处从 `udata` 解析 GPU 标记并打到本地 `cfg`；`udma_init_seg_cfg` / `udma_pin_pages_and_ioummu_map` / legacy 路径 / `udma_unpin_seg_pages` 分流不变 |
-| `urma/hw/udma/udma_main.c` | `MODULE_SOFTDEP("pre: udma_nv_p2p_bridge")` |
+| `urma/hw/udma/udma_main.c` | 无 `MODULE_SOFTDEP`——`udma.ko` 不依赖 nvidia/bridge 就能加载 |
 | `urma/hw/udma/Makefile` | 编译 `udma.ko`（含 `udma_gpu_p2p.o`）**和** `udma_nv_p2p_bridge.ko` 两个 `obj-m` 目标，`ccflags -I$(NV_P2P_HEADER_PATH)` |
-| `urma/Makefile` | OOT 独立编译 `urma/` 支持（`NV_P2P_HEADER_PATH`/`NV_MODULE_SYMVERS`） |
+| `urma/Makefile` | OOT 独立编译 `urma/` 支持（`NV_P2P_HEADER_PATH`/`NV_MODULE_SYMVERS`，只有 `udma_nv_p2p_bridge.ko` 需要） |
 | `Makefile`（根） | OOT 整树编译支持 |
 
 对应 UMDK 用户态需要改的地方（不在本仓库）：
@@ -136,7 +136,7 @@ SG 表不再依赖 NV 侧任何符号，`udma_gpu_build_sg_table()` 本地用 `p
 
 - URMA/UB 总线不是 PCI 设备，**不能**调用 `nvidia_p2p_dma_map_pages`（需要 `struct pci_dev *peer`）。只用 `get_pages` 返回的 `physical_address` 走 UMMU 自己的表即可，这对非 PCIe 第三方总线是唯一可行路径。
 
-### 4.1 换成经典 API 之后仍然 `Unknown symbol`？—— GPL/proprietary 边界，切独立 Dual BSD/GPL 桥接模块
+### 4.1 换成经典 API 之后仍然 `Unknown symbol`？—— GPL/proprietary 边界
 
 换成 `nvidia_p2p_get_pages`/`put_pages`/`free_page_table` 之后，在真实闭源驱动上依然报：
 
@@ -147,32 +147,80 @@ udma: Unknown symbol nvidia_p2p_get_pages (err -2)
 
 用 `cat /proc/kallsyms | grep nvidia_p2p_get_pages` 能确认符号**确实存在**于已加载的 `nvidia.ko`（`T nvidia_p2p_get_pages [nvidia]`，还有对应的 `__crc_`/`__ksymtab_` 项）——排除了"符号真的不存在"这个可能。
 
-原因：`udma.ko` 是 `MODULE_LICENSE("GPL")`，`nvidia.ko` 是 proprietary（`TAINT_PROPRIETARY_MODULE`）。让纯 GPL 模块直接静态链接 proprietary 模块的符号，`insmod` 阶段的符号解析（GPL taint 判定 + `CONFIG_MODVERSIONS` 开启时的 CRC 校验，这台机器 `vermagic` 里有 `modversions`）不干净，报错统一都是 `Unknown symbol X (err -2)`，没法从报错本身区分具体原因。
+原因：`udma.ko` 是 `MODULE_LICENSE("GPL")`，`nvidia.ko` 是 proprietary（`TAINT_PROPRIETARY_MODULE`）。让纯 GPL 模块直接静态链接 proprietary 模块的符号，`insmod` 阶段的符号解析（GPL taint 判定 + `CONFIG_MODVERSIONS` 开启时的 CRC 校验）不干净，报错统一都是 `Unknown symbol X (err -2)`。
 
-**修复（当前分支已采用，参照传统 RDMA 厂商模式）**：Mellanox `nvidia-peermem.ko` 本身就不是纯 GPL，而是 `MODULE_LICENSE("Dual BSD/GPL")`——这正是业界验证了十几年的标准做法：**专门切一个独立的小模块负责直接链接 proprietary 驱动的符号，License 用 Dual BSD/GPL，让真正的 RDMA 网卡驱动（这里是 udma.ko）完全不碰 proprietary 符号，只依赖这个自己完全掌控的桥接模块。**
+### 4.2 v1 修复（切独立 Dual BSD/GPL 桥接模块）—— 不够彻底
 
-新增 `udma_nv_p2p_bridge.ko`：
+参照 Mellanox `nvidia-peermem.ko` 是 `MODULE_LICENSE("Dual BSD/GPL")` 而不是纯 GPL，第一版修复切了一个独立的 `udma_nv_p2p_bridge.ko`（Dual BSD/GPL）直接链接 `nvidia.ko`，`EXPORT_SYMBOL` 自己的 wrapper（`udma_nv_p2p_get_pages`/`put_pages`/`free_page_table`），`udma.ko` 改成静态链接**这个桥接模块**的 wrapper 符号。
 
-```c
-// udma_nv_p2p_bridge.c
-MODULE_LICENSE("Dual BSD/GPL");   // 跟 nvidia-peermem.c 一模一样
+**结果同样的报错，只是模块名换了**：
 
-int udma_nv_p2p_get_pages(uint64_t gpu_va, uint64_t length,
-			  struct nvidia_p2p_page_table **page_table,
-			  void (*free_callback)(void *data), void *data)
-{
-	return nvidia_p2p_get_pages(0, 0, gpu_va, length, page_table,
-				    free_callback, data);
-}
-EXPORT_SYMBOL(udma_nv_p2p_get_pages);
-// ... put_pages / free_page_table 同理
+```
+udma: module using GPL-only symbols uses symbols udma_nv_p2p_get_pages from proprietary module udma_nv_p2p_bridge.
+udma: Unknown symbol udma_nv_p2p_get_pages (err -2)
 ```
 
-`udma.ko`（纯 GPL）里的 `udma_gpu_p2p.c` 只调 `udma_nv_p2p_get_pages()`/`udma_nv_p2p_put_pages()`/`udma_nv_p2p_free_page_table()` 这几个我们自己的 wrapper 符号——因为 `udma_nv_p2p_bridge.ko` 和 `udma.ko` 是同一个 `urma/hw/udma/Makefile` 里的两个 `obj-m` 目标，在**同一次** kbuild/modpost 里一起编译，彼此的符号互相可见，不需要额外的 `KBUILD_EXTRA_SYMBOLS` 拼接，CRC 天然一致（我们自己同时编两个 `.ko`，不存在"跨仓库/跨编译批次"的版本错配问题）。
+**根因**：内核 `inherit_taint()` 在模块解析符号时，只要 owner 模块（这里是 `nvidia.ko`）带 `TAINT_PROPRIETARY_MODULE`，就会**无条件**把这个 taint 传给调用方（`udma_nv_p2p_bridge.ko`），跟调用方自己声明什么 `MODULE_LICENSE` 完全无关。所以 `udma_nv_p2p_bridge.ko` 虽然声明 Dual BSD/GPL，链了 `nvidia.ko` 之后照样被打上 proprietary taint。`udma.ko` 再去静态链接**它**，自然撞上同一堵墙——这只是把"谁是 proprietary"这层皮往后挪了一层，taint 链没有被真正切断。
 
-真正触碰 `nvidia.ko` proprietary 符号、需要 `NV_MODULE_SYMVERS`/`KBUILD_EXTRA_SYMBOLS` 静态链接的，只剩 `udma_nv_p2p_bridge.ko` 这一个模块——它复刻的正是 `nvidia-peermem.ko` 已经验证过的 license 组合，静态解析理应正常工作。
+### 4.3 v2 修复（当前分支采用）—— 反转控制方向，注册回调而非静态链接
 
-加载顺序变成三级：`nvidia.ko` → `udma_nv_p2p_bridge.ko` → `udma.ko`（`udma_main.c` 的 `MODULE_SOFTDEP` 只声明了对 `udma_nv_p2p_bridge` 的直接依赖，`nvidia` 那一跳由 `udma_nv_p2p_bridge.ko` 自己的 `MODULE_SOFTDEP("pre: nvidia")` 负责；`softdep` 只有 `modprobe` 认，`insmod` 需要手动按顺序）。
+真正参照的是 Mellanox `ib_core.ko`（GPL）与 `nvidia-peermem.ko`（Dual BSD/GPL，同样因链 `nvidia.ko` 被打 proprietary taint）之间**真实**的关系，而不是简单切一个 Dual BSD/GPL 模块就完事：
+
+- `ib_core.ko` 导出一个通用注册接口 `ib_register_peer_memory_client(...)`；
+- `nvidia-peermem.ko` 在自己 `module_init()` 时**主动调用**这个接口，把一组指向自己内部函数的**函数指针**交给 `ib_core.ko`；
+- `ib_core.ko` 后续需要 pin GPU 内存时，通过**函数指针调用**（不是符号名链接）走到 `nvidia-peermem.ko` 的实现；
+- **`ib_core.ko` 全程不 `import` `nvidia-peermem.ko` 导出的任何符号**——因为它压根没有导出符号给 `ib_core.ko` 用，是反过来的。
+
+我们照抄这个模式：
+
+```c
+// udma_nv_p2p_bridge.h —— udma.ko 与 udma_nv_p2p_bridge.ko 之间的"契约"
+struct udma_gpu_p2p_ops {
+	int (*get_pages)(uint64_t gpu_va, uint64_t length,
+			 struct nvidia_p2p_page_table **page_table,
+			 void (*free_callback)(void *data), void *data);
+	int (*put_pages)(uint64_t gpu_va, struct nvidia_p2p_page_table *page_table);
+	int (*free_page_table)(struct nvidia_p2p_page_table *page_table);
+	struct module *owner;
+};
+
+/* udma.ko 导出实现（udma_gpu_p2p.c），普通 GPL 符号，不涉及任何 proprietary 符号 */
+int udma_register_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops);
+void udma_unregister_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops);
+```
+
+```c
+// udma_nv_p2p_bridge.c —— 反过来调 udma.ko 的注册接口
+static const struct udma_gpu_p2p_ops udma_nv_p2p_bridge_ops = {
+	.get_pages = udma_nv_p2p_bridge_get_pages,   // 内部转发到 nvidia_p2p_get_pages
+	.put_pages = udma_nv_p2p_bridge_put_pages,
+	.free_page_table = udma_nv_p2p_bridge_free_page_table,
+	.owner = THIS_MODULE,
+};
+
+static int __init udma_nv_p2p_bridge_init(void)
+{
+	return udma_register_gpu_p2p_ops(&udma_nv_p2p_bridge_ops);
+}
+```
+
+```c
+// udma_gpu_p2p.c —— udma.ko 内部调 NV P2P，全部走函数指针
+const struct udma_gpu_p2p_ops *ops = udma_gpu_p2p_ops_get();  // try_module_get(owner)
+ret = ops->get_pages(gpu_va, mapped_size, &page_table, callback, seg);
+udma_gpu_p2p_ops_put(ops);   // module_put(owner)
+```
+
+**为什么这次能彻底切断 taint 传播**：函数指针调用在内核模块加载器层面根本没有 `resolve_symbol()` 这一步——它就是普通的 C 函数指针调用，跟"这个函数属于哪个模块、那个模块什么 license"毫无关系。`udma.ko` 从头到尾没有静态解析过任何来自 `udma_nv_p2p_bridge.ko`（更不用说 `nvidia.ko`）的符号，`inherit_taint()` 自然没有触发的机会。反过来 `udma_nv_p2p_bridge.ko`（已经被 taint）去调 `udma.ko` 导出的 `udma_register_gpu_p2p_ops`，因为 `inherit_taint(mod, owner, name)` 只检查 **owner**（这里是 `udma.ko`）是不是 proprietary taint，`udma.ko` 干净，所以这个方向完全没问题，也不会反向把 taint 传回 `udma.ko`。
+
+**加载顺序也因此反转**：
+
+```
+v1（已废弃）: nvidia.ko -> udma_nv_p2p_bridge.ko -> udma.ko
+v2（当前）:   nvidia.ko -> udma.ko -> udma_nv_p2p_bridge.ko
+```
+
+`udma_nv_p2p_bridge.ko` 必须最后装——因为它 `module_init()` 时要反过来调 `udma.ko` 导出的符号，`udma.ko` 必须已经在跑。`udma.ko` 自己不再声明任何 `MODULE_SOFTDEP`：它完全可以独立加载，GPU 段注册在 bridge 装上之前会返回 `-ENODEV`，不影响其它 HOST 段功能；`nvidia.ko` → `udma_nv_p2p_bridge.ko` 这一跳由 bridge 自己的 `MODULE_SOFTDEP("pre: nvidia udma")` 负责（`softdep` 只有 `modprobe` 认，`insmod` 仍需手动按顺序）。
 
 ---
 
@@ -191,12 +239,12 @@ cd urma
 make NV_P2P_HEADER_PATH=... NV_MODULE_SYMVERS=...
 ```
 
-加载顺序（三级）：
+加载顺序（三级，注意 `udma_nv_p2p_bridge.ko` 最后装）：
 
 ```bash
 insmod nvidia.ko
-insmod urma/hw/udma/udma_nv_p2p_bridge.ko
 insmod urma/hw/udma/udma.ko
+insmod urma/hw/udma/udma_nv_p2p_bridge.ko
 ```
 
-`MODULE_SOFTDEP` 已经在各自模块里声明好依赖关系，用 `modprobe` 会自动处理；`insmod` 需要手动按上面顺序。
+`udma_nv_p2p_bridge.ko` 已声明 `MODULE_SOFTDEP("pre: nvidia udma")`，`modprobe` 会自动处理前两个依赖；`insmod` 仍需手动按上面顺序。

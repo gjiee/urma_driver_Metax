@@ -16,8 +16,11 @@ udma-$(CONFIG_UB_UDMA) := udma_main.o udma_cmd.o udma_common.o udma_ctx.o udma_d
 	     udma_safe_mode.o udma_gpu_p2p.o
 
 # GPU兼容测试补丁: 独立的 Dual BSD/GPL 桥接模块，专门链接闭源 nvidia.ko
-# 的符号，跟 udma.ko（纯 GPL）分开编译成两个 .ko，同一次 kbuild/modpost
-# 里互相可见，不需要额外 KBUILD_EXTRA_SYMBOLS。见 udma_nv_p2p_bridge.h
-# 单文件模块，Kbuild 会自动用 udma_nv_p2p_bridge.c 生成 udma_nv_p2p_bridge.ko
+# 的符号。udma.ko 不 import 桥接模块的任何符号——两者关系是桥接模块
+# 反过来调 udma.ko 导出的 udma_register_gpu_p2p_ops() 注册函数指针
+# （见 udma_nv_p2p_bridge.h），不是静态符号依赖。放在同一个 Makefile
+# 里编译成两个 .ko，同一次 kbuild/modpost 互相可见，不需要额外
+# KBUILD_EXTRA_SYMBOLS 拼接。单文件模块，Kbuild 自动用
+# udma_nv_p2p_bridge.c 生成 udma_nv_p2p_bridge.ko
 
 obj-m := udma.o udma_nv_p2p_bridge.o
