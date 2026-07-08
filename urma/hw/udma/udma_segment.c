@@ -12,6 +12,8 @@
 #include "udma_tid.h"
 #include "udma_seg_tree.h"
 #include "udma_segment.h"
+/* GPU兼容测试补丁 — SP4: GPU pin/unpin 与 flag 判定，见 udma_gpu_p2p.h */
+#include "udma_gpu_p2p.h"
 
 static int udma_align_segment(struct udma_segment *seg)
 {
@@ -80,6 +82,12 @@ static void udma_init_seg_cfg(struct udma_segment *seg, struct ubcore_seg_cfg *c
 	seg->token_value_valid = cfg->flag.bs.token_policy != UBCORE_TOKEN_NONE;
 	seg->addr = cfg->va;
 	seg->length = cfg->len;
+	/*
+	 * GPU兼容测试补丁 — 环节 4.1
+	 * 根据 cfg->flag.value bit15 标记 seg->is_gpu_seg
+	 * 后续 unpin / matt_map 据此分流
+	 */
+	seg->is_gpu_seg = udma_seg_cfg_is_gpu(cfg);
 }
 
 static int udma_u_get_seg_perm(struct ubcore_seg_cfg *cfg)
@@ -347,6 +355,16 @@ static void udma_unpin_seg_pages(struct udma_segment *seg, bool dirty)
 	if (seg == NULL)
 		return;
 
+	/*
+	 * GPU兼容测试补丁 — 环节 E（注销 unpin）
+	 * GPU 段: udma_gpu_unpin_seg_pages → put_pages_persistent + sg_free
+	 * HOST 段: 原 udma_umem_release / put_user_page
+	 */
+	if (udma_seg_is_gpu(seg)) {
+		udma_gpu_unpin_seg_pages(seg);
+		return;
+	}
+
 	if (seg->umem->va)
 		udma_umem_release(seg->umem, seg->kernel_mode, dirty);
 	else
@@ -477,6 +495,53 @@ static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct ud
 	bool dirty = false;
 	int ret = 0;
 
+	/*
+	 * GPU兼容测试补丁 — 环节 4.2～7（sva_sep_mode 用户态注册主路径）
+	 *
+	 * 当 cfg->flag.value & UBCORE_REG_SEG_GPU_VA:
+	 *   环节 5  udma_gpu_pin_seg_pages(ub_dev, seg, cfg)
+	 *           不可使用 pin_user_pages（GPU VA 无 CPU VMA）
+	 *   环节 6  seg->tid = tid  （tid 来自 udma_register_seg 的 udma_tid->tid）
+	 *   环节 7a 非 LOCAL_ONLY: udma_ioummu_remote_map(tid, seg, prot)
+	 *           → udma_ioummu_map(INVALID_TID, r_tid=tid, prot, seg->addr, sgt)
+	 *           → ummu_sva_matt_map(..., cfg->va 对齐地址, sgt, prot)
+	 *   环节 7b udma_iommu_local_map → 本地 ctx->tid matt_map
+	 */
+	if (udma_seg_cfg_is_gpu(cfg)) {
+		ret = udma_gpu_pin_seg_pages(to_udma_dev(ub_dev), seg, cfg);
+		if (unlikely(ret))
+			return ret;
+
+		seg->tid = tid;
+
+		if (!local_only) {
+			ret = udma_ioummu_remote_map(tid, seg, prot);
+			if (unlikely(ret)) {
+				dev_err(ctx->dev->dev,
+					"GPU seg ioummu remote map failed, ret=%d\n", ret);
+				goto err_gpu_pin;
+			}
+		}
+
+		ret = udma_iommu_local_map(ub_dev, ctx, seg, cfg, prot);
+		if (unlikely(ret)) {
+			dev_err(ctx->dev->dev,
+				"GPU seg ioummu local map failed, ret=%d\n", ret);
+			goto err_gpu_remote_unmap;
+		}
+
+		return 0;
+
+err_gpu_remote_unmap:
+		if (!local_only)
+			udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
+					  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
+err_gpu_pin:
+		udma_gpu_unpin_seg_pages(seg);
+		return ret;
+	}
+
+	/* HOST 段: pin_user_pages → SG(struct page) → UMMU（原逻辑） */
 	ret = udma_pin_seg_pages(ub_dev, ctx, seg, cfg, &prot);
 	if (unlikely(ret))
 		return ret;
@@ -568,8 +633,20 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 	}
 
 	if (!cfg->flag.bs.non_pin) {
-		ret = udma_pin_segment(ub_dev, cfg, seg,
-				       !!(cfg->flag.bs.access & UBCORE_ACCESS_WRITE));
+		/*
+		 * GPU兼容测试补丁 — legacy 路径（sva_sep_mode_en == 0）
+		 * 仅 pin，不走 udma_pin_pages_and_ioummu_map
+		 * GPU: udma_gpu_pin_seg_pages + seg->tid
+		 * HOST: udma_pin_segment
+		 */
+		if (udma_seg_cfg_is_gpu(cfg)) {
+			ret = udma_gpu_pin_seg_pages(udma_dev, seg, cfg);
+			if (!ret)
+				seg->tid = udma_tid->tid;
+		} else {
+			ret = udma_pin_segment(ub_dev, cfg, seg,
+					       !!(cfg->flag.bs.access & UBCORE_ACCESS_WRITE));
+		}
 		if (ret) {
 			dev_err(udma_dev->dev, "pin segment failed, ret = %d.\n", ret);
 			goto err_pin_seg;

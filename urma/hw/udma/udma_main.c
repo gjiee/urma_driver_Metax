@@ -1690,6 +1690,8 @@ module_init(udma_init);
 module_exit(udma_exit);
 MODULE_VERSION(UDMA_DRV_VER);
 MODULE_LICENSE("GPL");
+/* GPU兼容测试补丁 — SP4: 加载 udma.ko 前须先加载导出 P2P 符号的 nvidia.ko */
+MODULE_SOFTDEP("pre: nvidia");
 
 module_param(dev_name_style, bool, 0444);
 MODULE_PARM_DESC(dev_name_style, "Set device name style, default: 1(0:disable, 1:enable)");
