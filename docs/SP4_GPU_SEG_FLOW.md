@@ -134,6 +134,41 @@ SG 表不再依赖 NV 侧任何符号，`udma_gpu_build_sg_table()` 本地用 `p
 
 - URMA/UB 总线不是 PCI 设备，**不能**调用 `nvidia_p2p_dma_map_pages`（需要 `struct pci_dev *peer`）。只用 `get_pages` 返回的 `physical_address` 走 UMMU 自己的表即可，这对非 PCIe 第三方总线是唯一可行路径。
 
+### 4.1 换成经典 API 之后仍然 `Unknown symbol`？—— GPL/proprietary 边界 + symbol_get() 修复
+
+换成 `nvidia_p2p_get_pages`/`put_pages`/`free_page_table` 之后，在真实闭源驱动上依然报：
+
+```
+udma: module using GPL-only symbols uses symbols nvidia_p2p_get_pages from proprietary module nvidia.
+udma: Unknown symbol nvidia_p2p_get_pages (err -2)
+```
+
+用 `cat /proc/kallsyms | grep nvidia_p2p_get_pages` 能确认符号**确实存在**于已加载的 `nvidia.ko`（`T nvidia_p2p_get_pages [nvidia]`，还有对应的 `__crc_`/`__ksymtab_` 项）。
+
+原因：`udma.ko` 是 `MODULE_LICENSE("GPL")`，`nvidia.ko` 是 proprietary（`TAINT_PROPRIETARY_MODULE`）。`insmod` 阶段对这类跨 GPL/proprietary 边界的符号做**静态解析**——既要 GPL taint 判定通过，在 `CONFIG_MODVERSIONS` 开启时（这台机器 `vermagic` 里有 `modversions`）还要 CRC 完全匹配。任何一处不满足，内核给的报错**统一都是** `Unknown symbol X (err -2)`，没法从报错本身区分到底是 taint 问题还是 CRC 不匹配。
+
+**修复（当前分支已采用）**：不让 `insmod` 做静态符号解析，改用内核标准的 `symbol_get()`/`symbol_put()` 在运行时动态从 `kallsyms` 查函数地址：
+
+```c
+typedef typeof(nvidia_p2p_get_pages) *udma_fn_nvidia_p2p_get_pages_t;
+
+udma_fn_nvidia_p2p_get_pages_t get_pages =
+    (udma_fn_nvidia_p2p_get_pages_t)symbol_get(nvidia_p2p_get_pages);
+if (!get_pages) {
+    /* nvidia.ko 未加载，或者这台机器的驱动确实不导出这个符号 */
+}
+...
+ret = get_pages(0, 0, gpu_va, len, &page_table, callback, data);
+...
+symbol_put(nvidia_p2p_get_pages);
+```
+
+`symbol_get()` 宏内部把符号声明成 `__attribute__((weak))`，且只把符号名以**字符串**传给 `__symbol_get()`（内部走 `find_symbol()`），代码里从头到尾不出现对 `nvidia_p2p_get_pages(...)` 的直接函数调用——`udma_gpu_p2p.o` 里不会有任何针对这个符号名的 ELF 重定位项，`insmod udma.ko` 阶段**完全不要求这些符号存在**，查不到就在 `register_seg` 时返回错误，不会导致整个模块加载失败。
+
+另外，内核里 `__symbol_get()` 本身对 GPL-only 符号是无条件放行的（`find_symbol(..., gplok=true, ...)`，硬编码 `true`），不看调用方模块的 license——这比静态解析更宽松，天然绕开了 GPL taint 判定的坑。
+
+代价（已知简化，见 `udma_gpu_p2p.c` 文件头注释）：目前是"每次调用现取现还"，不是在整个 pin 期间常驻持有 `nvidia.ko` 的引用计数，理论上 `nvidia.ko` 可能在 pin 和 unpin 之间被 `rmmod`——暂不处理。
+
 ---
 
 ## 5. 编译

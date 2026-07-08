@@ -21,12 +21,13 @@ export UBASE_MODULE_SYMVERS
 all: modules
 
 check-nv-symvers:
-	@test -f "$(NV_MODULE_SYMVERS)" || { \
-		echo "ERROR: $(NV_MODULE_SYMVERS) not found"; exit 1; }
-	@grep -q nvidia_p2p_get_pages_persistent "$(NV_MODULE_SYMVERS)" || { \
-		echo "ERROR: rebuild nvidia.ko (need nvidia_p2p_get_pages_persistent export)"; exit 1; }
+	@test -f "$(NV_P2P_HEADER_PATH)/nv-p2p.h" || { \
+		echo "ERROR: nv-p2p.h not found under $(NV_P2P_HEADER_PATH) (needed for struct/type defs)"; exit 1; }
+	@test -f "$(NV_MODULE_SYMVERS)" && \
+		echo "NV_MODULE_SYMVERS found (optional now, udma_gpu_p2p.c resolves nvidia_p2p_* via symbol_get() at runtime, not static link)" || \
+		echo "NV_MODULE_SYMVERS not found ($(NV_MODULE_SYMVERS)) — OK, not required anymore"
 
-EXTRA_KBUILD_SYMVERS := $(abspath $(NV_MODULE_SYMVERS)) $(if $(wildcard $(UBASE_MODULE_SYMVERS)),$(abspath $(UBASE_MODULE_SYMVERS)),)
+EXTRA_KBUILD_SYMVERS := $(wildcard $(NV_MODULE_SYMVERS)) $(if $(wildcard $(UBASE_MODULE_SYMVERS)),$(abspath $(UBASE_MODULE_SYMVERS)),)
 
 modules: check-nv-symvers
 	mkdir -p $(BUILD_DIR)

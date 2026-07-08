@@ -27,16 +27,15 @@ modules:
 		echo "ERROR: nv-p2p.h not found under $(NV_P2P_HEADER_PATH)"; \
 		echo "  Use: NV_P2P_HEADER_PATH=/path/to/nv-p2p-header-dir"; \
 		exit 1; }
-	@test -f "$(NV_MODULE_SYMVERS)" || { \
-		echo "ERROR: Module.symvers not found: $(NV_MODULE_SYMVERS)"; \
-		echo "  Point NV_MODULE_SYMVERS at your nvidia.ko build's Module.symvers"; \
-		exit 1; }
+	@test -f "$(NV_MODULE_SYMVERS)" && \
+		echo "NV_MODULE_SYMVERS found, will pass via KBUILD_EXTRA_SYMBOLS (optional: udma_gpu_p2p.c now uses symbol_get() at runtime, not static linkage)" || \
+		echo "NV_MODULE_SYMVERS not found ($(NV_MODULE_SYMVERS)) — OK, not required anymore since nvidia_p2p_* are resolved via symbol_get() at runtime"
 	mkdir -p $(BUILD_DIR)
 	$(MAKE) -C $(KDIR) M=$(CURDIR) \
 		CONFIG_UB=m CONFIG_UB_UBASE=m CONFIG_UB_URMA=m CONFIG_UB_UDMA=m \
 		NV_P2P_HEADER_PATH=$(NV_P2P_HEADER_PATH) \
 		NV_MODULE_SYMVERS=$(abspath $(NV_MODULE_SYMVERS)) \
-		KBUILD_EXTRA_SYMBOLS="$(abspath $(NV_MODULE_SYMVERS))" \
+		KBUILD_EXTRA_SYMBOLS="$(wildcard $(NV_MODULE_SYMVERS))" \
 		modules
 	@find $(CURDIR) -name '*.ko' ! -path '$(BUILD_DIR)/*' -print0 | \
 		xargs -0 -r cp -t $(BUILD_DIR)/ 2>/dev/null || true
