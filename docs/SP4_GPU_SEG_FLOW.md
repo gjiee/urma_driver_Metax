@@ -62,8 +62,9 @@ udma_init_seg_cfg(): seg->is_gpu_seg = udma_seg_cfg_is_gpu(cfg)
 udma_pin_pages_and_ioummu_map() / legacy 非 pin 分支
     ↓ udma_seg_cfg_is_gpu(cfg) == true
 udma_gpu_pin_seg_pages()
-    → nvidia_p2p_get_pages_persistent(gpu_va, mapped_size, &page_table, 0)
-    → nvidia_p2p_build_sg_table_phys(page_table, &seg->umem->append.sgt)
+    → nvidia_p2p_get_pages(0, 0, gpu_va, mapped_size, &page_table,
+                           udma_gpu_p2p_free_callback, seg)
+    → udma_gpu_build_sg_table(page_table, &seg->umem->append.sgt)  // 本地拼，不依赖 NV
       (PA 写进 sg_dma_address)
     ↓
 seg->tid = tid
@@ -102,9 +103,36 @@ udma_ioummu_remote_map / udma_iommu_local_map
 
 ## 4. 依赖 & 闭源驱动注意事项
 
-- `nvidia_p2p_get_pages_persistent` / `nvidia_p2p_put_pages_persistent` 是 NVIDIA **官方稳定导出符号**，开源/闭源 `nvidia.ko` 都有，不需要改 NVIDIA 驱动源码。
-- `nvidia_p2p_build_sg_table_phys` **不是官方符号**，只存在于本项目自建的 `nv_module_netlab`（开源 fork）里。如果你的 GPU 不支持 open-gpu-kernel-modules（例如无 GSP 的卡，只能用闭源驱动），把 `udma_gpu_p2p.c` 里这一行换成本地实现（不依赖任何 NV 侧新增符号，只用 `struct nvidia_p2p_page_table`/`nvidia_p2p_page` 官方结构体自己拼 `sg_table`）。
-- URMA/UB 总线不是 PCI 设备，**不能**调用 `nvidia_p2p_dma_map_pages`（需要 `struct pci_dev *peer`）。只用 `get_pages_persistent` 返回的 `physical_address` 走 UMMU 自己的表即可，这对非 PCIe 第三方总线是唯一可行路径。
+**已实测**: `nvidia_p2p_get_pages_persistent` / `nvidia_p2p_put_pages_persistent` / `nvidia_p2p_build_sg_table_phys` 在闭源驱动上 `insmod udma.ko` 会报：
+
+```
+udma: Unknown symbol nvidia_p2p_build_sg_table_phys (err -2)
+udma: Unknown symbol nvidia_p2p_put_pages_persistent (err -2)
+udma: Unknown symbol nvidia_p2p_get_pages_persistent (err -2)
+```
+
+原因：
+
+- `nvidia_p2p_build_sg_table_phys` 从来就不是官方符号，只存在于本项目自建的 `nv_module_netlab`（开源 fork）里。
+- `nvidia_p2p_get_pages_persistent`/`put_pages_persistent` 是较新加入的 API（GDS 相关），部分闭源驱动版本未导出。
+
+**修复（当前分支已采用）**：改用 NVIDIA 从最早 GPUDirect RDMA 时代起就稳定导出、`nvidia-peermem.ko` 用了十几年的经典 API：
+
+```c
+int nvidia_p2p_get_pages(uint64_t p2p_token, uint32_t va_space,
+        uint64_t virtual_address, uint64_t length,
+        struct nvidia_p2p_page_table **page_table,
+        void (*free_callback)(void *data), void *data);
+
+int nvidia_p2p_put_pages(uint64_t p2p_token, uint32_t va_space,
+        uint64_t virtual_address, struct nvidia_p2p_page_table *page_table);
+```
+
+唯一区别：`get_pages` 强制要求非 NULL 的 `free_callback`（GPU 内存被 App 提前 `cudaFree` 时异步调用）。`udma_gpu_p2p.c` 里的 `udma_gpu_p2p_free_callback()` 目前只是**最小实现**（打日志 + 标记 `force_freed`，不做完整的向上层失效传播）——这是已知简化，TODO 见该函数注释，只要测试流程严格 "register → 用 → unregister"、不提前 `cudaFree`，就不会触发。
+
+SG 表不再依赖 NV 侧任何符号，`udma_gpu_build_sg_table()` 本地用 `page_table->pages[i]->physical_address`（官方公开稳定字段）自己拼 `sg_table`。
+
+- URMA/UB 总线不是 PCI 设备，**不能**调用 `nvidia_p2p_dma_map_pages`（需要 `struct pci_dev *peer`）。只用 `get_pages` 返回的 `physical_address` 走 UMMU 自己的表即可，这对非 PCIe 第三方总线是唯一可行路径。
 
 ---
 

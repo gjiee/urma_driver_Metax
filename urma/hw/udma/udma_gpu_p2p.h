@@ -77,6 +77,27 @@ static inline bool udma_seg_ucmd_is_gpu(struct ubcore_udata *udata)
 	return ucmd.is_gpu_seg != 0;
 }
 
+/*
+ * GPU兼容测试补丁: 闭源 nvidia.ko 符号依赖说明
+ *
+ * nvidia_p2p_get_pages_persistent / nvidia_p2p_put_pages_persistent /
+ * nvidia_p2p_build_sg_table_phys 在闭源驱动上 insmod 会报
+ * "Unknown symbol ... (err -2)" —— 这三个符号在官方闭源驱动里根本不存在
+ * (build_sg_table_phys 本来就是本项目在开源 fork 里自己加的；
+ *  *_persistent 系列在你这版闭源驱动上同样未导出/不可用)。
+ *
+ * 改用 NVIDIA 从最早期 GPUDirect RDMA 起就一直稳定导出、
+ * nvidia-peermem.ko 用了十几年的经典 API：
+ *   nvidia_p2p_get_pages(p2p_token=0, va_space=0, va, len,
+ *                        &page_table, free_callback, data)
+ *   nvidia_p2p_put_pages(p2p_token=0, va_space=0, va, page_table)
+ * 唯一区别: 必须传一个非 NULL 的 free_callback，NV 在 GPU 内存被
+ * App 提前释放（这段还没 unregister）时异步调用它。
+ *
+ * SG 表不再指望 NV 侧提供，直接在 udma_gpu_p2p.c 里用
+ * page_table->pages[i]->physical_address（公开稳定 ABI 字段）自己拼。
+ */
+
 //GPU兼容测试补丁: NVIDIA P2P 仅支持 64KB 页，与 NVIDIA_P2P_PAGE_SIZE_64KB 一致
 #define UDMA_GPU_P2P_PAGE_SHIFT		16
 #define UDMA_GPU_P2P_PAGE_SIZE		((uint64_t)1 << UDMA_GPU_P2P_PAGE_SHIFT)
@@ -121,7 +142,7 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 
 /*
  * GPU兼容测试补丁: 释放 GPU pin 与 SG
- * @seg: 必须 is_gpu_seg；调用 nvidia_p2p_put_pages_persistent + sg_free_table
+ * @seg: 必须 is_gpu_seg；调用 nvidia_p2p_put_pages + sg_free_table
  */
 void udma_gpu_unpin_seg_pages(struct udma_segment *seg);
 

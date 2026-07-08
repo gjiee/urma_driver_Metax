@@ -15,14 +15,22 @@ struct nvidia_p2p_page_table;
 
 /*
  * GPU兼容测试补丁: GPU 段 pin 后的持久化状态
- * page_table: nvidia_p2p_get_pages_persistent 返回值，unpin 时归还
- * gpu_va:     64KB 对齐后的 pin 起始 VA（= seg->addr）
+ * page_table:  nvidia_p2p_get_pages() 返回值，unpin 时 nvidia_p2p_put_pages() 归还
+ * gpu_va:      64KB 对齐后的 pin 起始 VA（= seg->addr），nvidia_p2p_put_pages()
+ *              的 virtual_address 参数也用它
  * mapped_size: 实际 pin 的字节长度（= seg->length）
+ * force_freed: NV 侧异步 free_callback 被调用后置位（GPU 内存被 App 提前释放，
+ *              而 URMA 段还没 unregister）。置位后 unpin 路径不再调用
+ *              nvidia_p2p_put_pages()（page_table 已经被 NV 内部释放，
+ *              重复调用未定义），只做本地清理。
+ *              这是 TODO：正确做法应该在此时通知 ubcore/上层使该段失效，
+ *              当前测试补丁只打印错误日志，不做进一步传播。
  */
 struct udma_gpu_p2p_mem {
 	struct nvidia_p2p_page_table *page_table;
 	uint64_t gpu_va;
 	uint64_t mapped_size;
+	bool force_freed;
 };
 
 struct udma_segment {
