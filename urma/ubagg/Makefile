@@ -7,11 +7,17 @@ ccflags-y += -I$(src)
 
 ubagg-objs := ubagg_bitmap.o \
 ubagg_log.o \
+ubagg_dfx.o \
+ubagg_msg.o \
 ubagg_seg.o \
 ubagg_hash_table.o \
 ubagg_ioctl.o \
 ubagg_topo_info.o \
+ubagg_device.o \
 ubagg_netlink.o \
+ubagg_failback.o \
+ubagg_session.o \
+ubagg_connect.o \
 ubagg_main.o \
 ubagg_jetty.o
 

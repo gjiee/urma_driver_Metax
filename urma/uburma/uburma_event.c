@@ -126,7 +126,7 @@ void uburma_jfce_handler(struct ubcore_jfc *jfc)
 {
 	struct uburma_jfc_uobj *jfc_uobj;
 	struct uburma_jfce_uobj *jfce;
-	struct uburma_device *ubu_dev;
+	struct uburma_device *ubu_dev = NULL;
 	bool write_event = false;
 	u64 start_time, duration_ns;
 
@@ -180,11 +180,22 @@ static int uburma_delete_jfce(struct inode *inode, struct file *filp)
 	struct uburma_uobj *uobj = filp->private_data;
 	struct uburma_file *ufile;
 
-	if (!uobj || !uobj->ufile)
+	if (!uobj)
 		return 0;
 
 	ufile = uobj->ufile;
+	if (!ufile) {
+		/* cleanup done, only put fops ref paired with alloc_commit */
+		uobj_put(uobj);
+		return 0;
+	}
+
 	down_write(&ufile->ucontext_rwsem);
+	if (!uobj->ufile) {
+		up_write(&ufile->ucontext_rwsem);
+		uobj_put(uobj);
+		return 0;
+	}
 
 	uobj_get(uobj);
 	/* will call uburma_hot_unplug_jfce if clean up is not going on */
@@ -434,15 +445,27 @@ static int uburma_delete_jfae(struct inode *inode, struct file *filp)
 		container_of(uobj, struct uburma_jfae_uobj, uobj);
 	struct uburma_file *ufile;
 
-	if (!uobj || !jfae || !uobj->ufile)
+	if (!uobj || !jfae) {
+		uburma_log_err("jfae has been released.\n");
 		return 0;
+	}
 
 	ufile = uobj->ufile;
+	if (!ufile) {
+		/* cleanup done, only put fops ref paired with alloc_commit */
+		uobj_put(uobj);
+		return 0;
+	}
+
 	down_write(&ufile->ucontext_rwsem);
+	if (!uobj->ufile) {
+		up_write(&ufile->ucontext_rwsem);
+		uobj_put(uobj);
+		return 0;
+	}
 	uobj_get(uobj);
 	/* call uburma_hot_unplug_jfae when cleanup is not going on */
 	uburma_close_uobj_fd(filp);
-	uburma_uninit_jfe(&jfae->jfe);
 	uobj->ufile = NULL;
 	uobj_put(uobj);
 	up_write(&ufile->ucontext_rwsem);
@@ -587,6 +610,8 @@ void uburma_release_comp_event(struct uburma_jfce_uobj *jfce,
 
 	spin_lock_irq(&jfe->lock);
 	list_for_each_entry_safe(event, tmp, event_list, obj_node) {
+		if (!list_empty(&event->obj_node))
+			list_del_init(&event->obj_node);
 		list_del(&event->node);
 		kfree(event);
 	}
@@ -602,6 +627,8 @@ void uburma_release_async_event(struct uburma_file *ufile,
 
 	spin_lock_irq(&jfe->lock);
 	list_for_each_entry_safe(event, tmp, event_list, obj_node) {
+		if (!list_empty(&event->obj_node))
+			list_del_init(&event->obj_node);
 		list_del(&event->node);
 		kfree(event);
 	}
@@ -694,14 +721,25 @@ static int uburma_delete_notifier(struct inode *inode, struct file *filp)
 	struct uburma_uobj *uobj = filp->private_data;
 	struct uburma_file *ufile;
 
-	if (!uobj || !uobj->ufile)
+	if (!uobj)
 		return 0;
 
-	uobj_get(uobj);
 	ufile = uobj->ufile;
-	uburma_flush_notifier(uobj, ufile);
+	if (!ufile) {
+		/* cleanup done, only put fops ref paired with alloc_commit */
+		uobj_put(uobj);
+		return 0;
+	}
 
 	down_write(&ufile->ucontext_rwsem);
+	if (!uobj->ufile) {
+		up_write(&ufile->ucontext_rwsem);
+		uobj_put(uobj);
+		return 0;
+	}
+	uobj_get(uobj);
+	uburma_flush_notifier(uobj, ufile);
+
 	/* call uburma_hot_unplug_notifier when cleanup is not going on */
 	uburma_close_uobj_fd(filp);
 	uobj->ufile = NULL;

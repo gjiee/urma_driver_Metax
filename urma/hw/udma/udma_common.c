@@ -23,7 +23,7 @@ static int udma_verify_input(struct udma_umem_param *param)
 
 	if (((param->va + param->len) < param->va) ||
 		PAGE_ALIGN(param->va + param->len) < (param->va + param->len)) {
-		dev_err(udma_dev->dev, "invalid pin_page param, len=%llu.\n",
+		dev_err(udma_dev->dev, "invalid pin page parameter, len=%llu.\n",
 			param->len);
 		return -EINVAL;
 	}
@@ -109,7 +109,7 @@ static uint64_t udma_pin_all_pages(struct udma_dev *udma_dev, struct udma_umem *
 						       GFP_KERNEL);
 		if (ret) {
 			dev_err(udma_dev->dev,
-				"failed to sg alloc append table failed, page_count: %llu.\n",
+				"failed to SG alloc append table failed, page_count: %llu.\n",
 				page_count);
 			unpin_user_pages_dirty_lock(page_list, pinned, 0);
 			udma_unpin_pages_by_sgtable(umem, false);
@@ -132,7 +132,7 @@ static uint64_t udma_k_pin_pages(struct udma_dev *dev, struct udma_umem *umem,
 
 	ret = sg_alloc_table(&umem->append.sgt, (unsigned int)npages, GFP_KERNEL);
 	if (ret) {
-		dev_err(dev->dev, "failed to sg alloc table failed.\n");
+		dev_err(dev->dev, "failed to SG alloc table.\n");
 		return 0;
 	}
 	sg_cur = umem->append.sgt.sgl;
@@ -188,7 +188,7 @@ static struct udma_umem *udma_get_target_umem(struct udma_umem_param *param)
 	} else {
 		gup_flags = (param->flag.bs.writable == 1) ? FOLL_WRITE : 0;
 		page_list = (struct page **)__get_free_page(GFP_KERNEL);
-		if (page_list == 0) {
+		if (!page_list) {
 			ret = -ENOMEM;
 			goto umem_kfree;
 		}
@@ -329,9 +329,11 @@ static inline uint32_t udma_adv_jetty_id_alloc(struct udma_dev *udma_dev, uint32
 					       uint32_t next_bit, uint32_t start_idx,
 					       struct udma_group_bitmap *bitmap_table)
 {
+	unsigned long tmp_bit;
 	uint32_t bit_idx;
 
-	bit_idx = find_next_bit((unsigned long *)bit, NUM_JETTY_PER_GROUP, next_bit);
+	tmp_bit = *bit;
+	bit_idx = find_next_bit(&tmp_bit, NUM_JETTY_PER_GROUP, next_bit);
 	*bit &= ~(1U << bit_idx);
 
 	return bitmap_table->min + start_idx + bit_idx;
@@ -625,7 +627,7 @@ int udma_alloc_normal_buf(struct udma_dev *udma_dev, size_t memory_size,
 		ret = PTR_ERR(buf->umem);
 		vfree(buf->kva);
 		buf->kva = NULL;
-		dev_err(udma_dev->dev, "pin kernel buf failed, ret = %d.\n", ret);
+		dev_err(udma_dev->dev, "pin kernel buffer failed, ret = %d.\n", ret);
 		return ret;
 	}
 
@@ -664,7 +666,7 @@ udma_alloc_hugepage_priv(struct udma_dev *dev, uint32_t len)
 
 	priv->umem = udma_pin_k_addr(&dev->ub_dev, (uint64_t)priv->va_base, priv->va_len);
 	if (IS_ERR(priv->umem)) {
-		dev_err(dev->dev, "pin kernel buf failed.\n");
+		dev_err(dev->dev, "pin kernel buffer failed.\n");
 		goto err_pin;
 	}
 
@@ -768,7 +770,7 @@ static void *udma_iova_map(struct udma_dev *udma_dev, uint32_t size, struct udma
 
 	pa_addr = page_to_phys(buf->pages);
 	if (pa_addr < udma_dev->dtu_info.pa_base) {
-		dev_err(udma_dev->dev, "phy addr is error.\n");
+		dev_err(udma_dev->dev, "physical address is error.\n");
 		goto err_free_mem;
 	}
 	buf->addr = pa_addr - udma_dev->dtu_info.pa_base + udma_dev->dtu_info.iova_base;
@@ -802,7 +804,7 @@ int udma_k_alloc_buf(struct udma_dev *dev, struct udma_buf *buf, bool need_dtu)
 			return ret;
 		}
 
-		dev_warn(dev->dev, "map iova failed.\n");
+		dev_warn(dev->dev, "DTU IOVA map unavailable, fallback to normal.\n");
 	}
 
 	buf->k_dtu_enable = false;
@@ -897,7 +899,7 @@ int udma_query_ue_idx(struct ubcore_device *ubcore_dev, struct ubcore_devid *dev
 	int ret;
 
 	if (!devid) {
-		dev_err(dev->dev, "failed to query ue idx, devid is NULL.\n");
+		dev_err(dev->dev, "failed to query UE index, devid is NULL.\n");
 		return -EINVAL;
 	}
 
@@ -908,7 +910,7 @@ int udma_query_ue_idx(struct ubcore_device *ubcore_dev, struct ubcore_devid *dev
 
 	ret = ubase_cmd_send_inout(dev->comdev.adev, &in, &out);
 	if (ret) {
-		dev_err(dev->dev, "failed to query ue idx, ret = %d.\n", ret);
+		dev_err(dev->dev, "failed to query UE index, ret = %d.\n", ret);
 		return ret;
 	}
 	*ue_idx = cmd.ue_idx;
@@ -921,12 +923,14 @@ void udma_dfx_ctx_print(struct udma_dev *udev, const char *name, uint32_t id, ui
 {
 	uint32_t i;
 
-	pr_info("*************udma%u %s(%u) CONTEXT INFO *************\n",
-		udev->adev_id, name, id);
+	pr_info("*************%s %s(%u) CONTEXT INFO *************\n",
+		udev->dev_name, name, id);
 
 	for (i = 0; i < len; ++i)
-		pr_info("udma%u %s(%u) CONTEXT(byte%4lu): %08x\n",
-			udev->adev_id, name, id, (i + 1) * sizeof(uint32_t), ctx[i]);
+		pr_info("%s %s(%u) CONTEXT(byte%4u): %08x\n",
+			udev->dev_name, name, id,
+			(i + 1) * (uint32_t)sizeof(uint32_t),
+			ctx[i]);
 
 	pr_info("**************************************************\n");
 }
@@ -1006,13 +1010,13 @@ int udma_dtu_uva_remap(struct udma_dev *dev, struct udma_buf *buf,
 	buf->addr = dev->dtu_info.va_base + page_to_phys(dtu_pg_info->pg) - dev->dtu_info.pa_base;
 	vma = find_vma(current->mm, buf->addr);
 	if (vma == NULL || vma->vm_start > buf->addr || vma->vm_end < buf->addr + buf_len) {
-		dev_err(dev->dev, "failed to find vma.\n");
+		dev_err(dev->dev, "failed to find VMA.\n");
 		ret = -EINVAL;
 		goto err_free_pages;
 	}
 	if (!((vma->vm_flags & VM_WIPEONFORK) && (vma->vm_flags & VM_DONTEXPAND) &&
 	    (vma->vm_flags & VM_DONTCOPY) && (vma->vm_flags & VM_IO))) {
-		dev_err(dev->dev, "failed to check vma flags.\n");
+		dev_err(dev->dev, "failed to check VMA flags.\n");
 		ret = -EINVAL;
 		goto err_free_pages;
 	}
@@ -1020,7 +1024,7 @@ int udma_dtu_uva_remap(struct udma_dev *dev, struct udma_buf *buf,
 	ret = remap_pfn_range(vma, buf->addr, (uint64_t)page_to_pfn(dtu_pg_info->pg),
 			      buf_len, vma->vm_page_prot);
 	if (ret) {
-		dev_err(dev->dev, "failed to remap pfn, ret = %d.\n", ret);
+		dev_err(dev->dev, "failed to remap PFN, ret = %d.\n", ret);
 		goto err_free_pages;
 	}
 	mmap_write_unlock(current->mm);

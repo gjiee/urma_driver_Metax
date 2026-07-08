@@ -11,6 +11,7 @@
 #include "udma_jetty.h"
 #include "udma_ctrlq_tp.h"
 #include "udma_cmd.h"
+#include "udma_seg_tree.h"
 #include "udma_ctx.h"
 
 static int udma_init_ctx_resp(struct udma_dev *dev, struct ubcore_udrv_priv *udrv_data, bool dtu_en)
@@ -21,7 +22,7 @@ static int udma_init_ctx_resp(struct udma_dev *dev, struct ubcore_udrv_priv *udr
 	if (!udrv_data->out_addr ||
 	    udrv_data->out_len < sizeof(resp)) {
 		dev_err(dev->dev,
-			"Invalid ctx resp out: len %d or addr is invalid.\n",
+			"Invalid ctx resp out: len %u or address is invalid.\n",
 			udrv_data->out_len);
 		return -EINVAL;
 	}
@@ -37,6 +38,9 @@ static int udma_init_ctx_resp(struct udma_dev *dev, struct ubcore_udrv_priv *udr
 	resp.sq_reserved = dev->sq_reserved_info.sq_reserved;
 	resp.sq_reserved_va = dev->sq_reserved_info.va_start;
 	resp.sq_reserved_len = dev->sq_reserved_info.va_size;
+	resp.lock_buffer_en = dev->caps.lock_buffer_en;
+	resp.ccu_jfc_property_en = dev->caps.ccu_jfc_property_en;
+	resp.lock_buf_bb_shift = dev->caps.lock_buf_bb_shift;
 	resp.atomic_add_en = dev->caps.atomic_add_en;
 	resp.u_dtu_enable = dtu_en;
 	resp.dtu_va_base = dev->dtu_info.va_base;
@@ -60,13 +64,15 @@ static int udma_init_ctx_resp(struct udma_dev *dev, struct ubcore_udrv_priv *udr
 
 static void udma_put_usva_tid(struct udma_dev *dev, struct udma_context *ctx)
 {
+	struct udma_seg_tree *to_destroy = NULL;
+
 	if (dev->caps.sva_sep_mode_en) {
-		mutex_lock(&dev->seg_tree_mutex);
-		if (refcount_dec_and_test(&ctx->seg_node->ctx_refcnt)) {
-			udma_seg_tree_destroy(ctx->seg_node);
-			__xa_erase(&dev->seg_tree_table, ctx->tid);
-		}
-		mutex_unlock(&dev->seg_tree_mutex);
+		mutex_lock(&g_seg_tree_mutex);
+		if (refcount_dec_and_test(&ctx->seg_tree->ctx_refcnt))
+			to_destroy = __xa_erase(&g_seg_tree_table, ctx->tid);
+		mutex_unlock(&g_seg_tree_mutex);
+		if (to_destroy)
+			udma_seg_tree_destroy(to_destroy);
 
 		ummu_core_free_tdev(ctx->ummu_dev);
 	} else {
@@ -76,42 +82,36 @@ static void udma_put_usva_tid(struct udma_dev *dev, struct udma_context *ctx)
 
 static int udma_get_usva_tid(struct udma_dev *dev, struct udma_context *ctx)
 {
-#ifdef CONFIG_UB_UMMU_SVA_SEPARATED_PAGES
 	struct tdev_opt opt = { current->mm, true };
-#endif
 	int ret = -ENOMEM;
 
 	if (dev->caps.sva_sep_mode_en) {
 		ctx->tid = UMMU_INVALID_TID;
-#ifdef CONFIG_UB_UMMU_SVA_SEPARATED_PAGES
 		ctx->ummu_dev = ummu_core_alloc_separate_tdev(&opt, &ctx->tid);
-#else
-		ctx->ummu_dev = ummu_alloc_tdev_separated(&ctx->tid);
-#endif
 		if (!ctx->ummu_dev) {
-			dev_err(dev->dev, "Failed to alloc separate pages USVA device.\n");
+			dev_err(dev->dev, "failed to alloc separate pages USVA device.\n");
 			goto err_alloc_tdev_separated;
 		}
 
-		mutex_lock(&dev->seg_tree_mutex);
-		ctx->seg_node = xa_load(&dev->seg_tree_table, ctx->tid);
-		if (ctx->seg_node) {
-			refcount_inc(&ctx->seg_node->ctx_refcnt);
+		mutex_lock(&g_seg_tree_mutex);
+		ctx->seg_tree = xa_load(&g_seg_tree_table, ctx->tid);
+		if (ctx->seg_tree) {
+			refcount_inc(&ctx->seg_tree->ctx_refcnt);
 			ret = 0;
 		} else {
-			ctx->seg_node = udma_seg_range_init();
-			if (!ctx->seg_node) {
-				dev_err(dev->dev, "Failed to init segment_range.\n");
+			ctx->seg_tree = udma_seg_tree_init();
+			if (!ctx->seg_tree) {
+				dev_err(dev->dev, "failed to init segment_range.\n");
 				goto err_segment_range_init;
 			}
-			ret = xa_err(__xa_store(&dev->seg_tree_table, ctx->tid,
-						ctx->seg_node, GFP_ATOMIC));
+			ret = xa_err(__xa_store(&g_seg_tree_table, ctx->tid,
+						ctx->seg_tree, GFP_ATOMIC));
 			if (ret) {
-				dev_err(dev->dev, "Failed to store segment_range, ret=%d.\n", ret);
+				dev_err(dev->dev, "failed to store segment_range, ret=%d.\n", ret);
 				goto err_segment_range_store;
 			}
 		}
-		mutex_unlock(&dev->seg_tree_mutex);
+		mutex_unlock(&g_seg_tree_mutex);
 	} else {
 		ctx->sva = iommu_sva_bind_device_isolated(dev->dev, current->mm, NULL);
 		if (IS_ERR(ctx->sva)) {
@@ -121,7 +121,7 @@ static int udma_get_usva_tid(struct udma_dev *dev, struct udma_context *ctx)
 
 		ret = ummu_get_tid(dev->dev, ctx->sva, &ctx->tid);
 		if (ret) {
-			dev_err(dev->dev, "Failed to get tid, ret = %d.\n", ret);
+			dev_err(dev->dev, "failed to get TID, ret = %d.\n", ret);
 			iommu_sva_unbind_device_isolated(ctx->sva);
 		}
 	}
@@ -129,9 +129,9 @@ static int udma_get_usva_tid(struct udma_dev *dev, struct udma_context *ctx)
 	return ret;
 
 err_segment_range_store:
-	udma_seg_tree_destroy(ctx->seg_node);
+	udma_seg_tree_destroy(ctx->seg_tree);
 err_segment_range_init:
-	mutex_unlock(&dev->seg_tree_mutex);
+	mutex_unlock(&g_seg_tree_mutex);
 	ummu_core_free_tdev(ctx->ummu_dev);
 err_alloc_tdev_separated:
 
@@ -152,7 +152,7 @@ struct ubcore_ucontext *udma_alloc_ucontext(struct ubcore_device *ub_dev,
 
 	ret = udma_get_usva_tid(dev, ctx);
 	if (ret) {
-		dev_err(dev->dev, "Failed to get usva tid, ret = %d.\n", ret);
+		dev_err(dev->dev, "failed to get USVA TID, ret = %d.\n", ret);
 		goto err_free_ctx;
 	}
 	ctx->dtu_en = dev->dtu_info.u_dtu_enable;
@@ -172,7 +172,7 @@ struct ubcore_ucontext *udma_alloc_ucontext(struct ubcore_device *ub_dev,
 
 	ret = udma_init_ctx_resp(dev, udrv_data, ctx->dtu_en);
 	if (ret) {
-		dev_err(dev->dev, "Init ctx resp failed.\n");
+		dev_err(dev->dev, "init context response failed.\n");
 		goto err_init_ctx_resp;
 	}
 
@@ -182,6 +182,7 @@ err_init_ctx_resp:
 	mutex_destroy(&ctx->page_lock);
 	mutex_destroy(&ctx->hugepage_lock);
 	mutex_destroy(&ctx->pgdir_mutex);
+	udma_unset_dtu_va_info(dev, ctx);
 	udma_put_usva_tid(dev, ctx);
 err_free_ctx:
 	kfree(ctx);
@@ -336,7 +337,7 @@ udma_alloc_page_priv(struct udma_context *ctx, struct vm_area_struct *vma, uint3
 				      page_to_pfn(priv->pages[i]), PAGE_SIZE,
 				      vma->vm_page_prot);
 		if (ret) {
-			dev_err(ctx->dev->dev, "failed to remap_pfn_range, ret=%d.\n", ret);
+			dev_err(ctx->dev->dev, "failed to remap PFN range, ret=%d.\n", ret);
 			goto err_remap_pfn_range;
 		}
 	}
@@ -344,7 +345,7 @@ udma_alloc_page_priv(struct udma_context *ctx, struct vm_area_struct *vma, uint3
 	ret = sg_alloc_table_from_pages(&priv->sgt, priv->pages, priv->page_num, 0,
 					priv->page_num << PAGE_SHIFT, GFP_KERNEL);
 	if (ret) {
-		dev_err(ctx->dev->dev, "failed to create sg table, ret=%d.\n", ret);
+		dev_err(ctx->dev->dev, "failed to create SG table, ret=%d.\n", ret);
 		goto err_remap_pfn_range;
 	}
 	priv->va_base = (void *)vma->vm_start;
@@ -437,7 +438,7 @@ int udma_mmap(struct ubcore_ucontext *uctx, struct vm_area_struct *vma)
 	case UDMA_MMAP_KERNEL_BUF:
 		return udma_mmap_kernel_buf(udma_dev, uctx, vma);
 	default:
-		dev_err(udma_dev->dev, "mmap failed, cmd(%u) not support\n", cmd);
+		dev_err(udma_dev->dev, "mmap failed, command(%u) not support\n", cmd);
 		return -EINVAL;
 	}
 
@@ -482,7 +483,7 @@ udma_get_page_priv(struct udma_context *ctx, uint64_t va, uint32_t len)
 	vma = find_vma(current->mm, va);
 	if (vma == NULL || vma->vm_start != va || vma->vm_end < va + align_size ||
 	    va & ~PAGE_MASK || vma->vm_end & ~PAGE_MASK) {
-		dev_err(ctx->dev->dev, "failed to find vma.\n");
+		dev_err(ctx->dev->dev, "failed to find VMA.\n");
 		ret = -EINVAL;
 		goto err_unlock;
 	}
@@ -490,7 +491,7 @@ udma_get_page_priv(struct udma_context *ctx, uint64_t va, uint32_t len)
 	// zap vma ptes before remap to avoid existed page
 	zap_vma_ptes(vma, (unsigned long)va, align_size);
 	if (!udma_check_vma_flags(vma)) {
-		dev_err(ctx->dev->dev, "failed to check vma flags.\n");
+		dev_err(ctx->dev->dev, "failed to check VMA flags.\n");
 		ret = -EINVAL;
 		goto err_unlock;
 	}
@@ -545,7 +546,7 @@ struct udma_page_priv *udma_get_map_page_priv(struct udma_context *ctx, uint64_t
 		ret = udma_ioummu_map(ctx->tid, UMMU_INVALID_TID, IOMMU_READ | IOMMU_WRITE,
 				      (uint64_t)priv->va_base, &(priv->sgt));
 		if (ret) {
-			dev_err(ctx->dev->dev, "udma iommu map failed, ret = %d.\n", ret);
+			dev_err(ctx->dev->dev, "UDMA IOMMU map failed, ret = %d.\n", ret);
 			udma_free_page_priv(ctx, priv);
 			return NULL;
 		}
@@ -626,7 +627,7 @@ static int udma_remap_hugepage(struct udma_context *ctx, struct vm_area_struct *
 					   page_to_pfn(priv->pages[i]), priv->page_size,
 					   vma->vm_page_prot);
 		if (ret) {
-			dev_err(ctx->dev->dev, "failed to remap_pfn_range, ret=%d.\n", ret);
+			dev_err(ctx->dev->dev, "failed to remap PFN range, ret=%d.\n", ret);
 			goto err_remap_pfn_range;
 		}
 	}
@@ -667,14 +668,14 @@ udma_alloc_u_hugepage_priv(struct udma_context *ctx, struct vm_area_struct *vma)
 		ret = udma_create_sgt_from_pages(&priv->sgt, priv->pages, priv->page_num,
 						 priv->page_size);
 		if (ret) {
-			dev_err(ctx->dev->dev, "failed to create sg table, ret=%d.\n", ret);
+			dev_err(ctx->dev->dev, "failed to create SG table, ret=%d.\n", ret);
 			goto err_create_sgt_from_pages;
 		}
 
 		ret = udma_ioummu_map(ctx->tid, UMMU_INVALID_TID, IOMMU_READ | IOMMU_WRITE,
 				      vma->vm_start, &priv->sgt);
 		if (ret) {
-			dev_err(ctx->dev->dev, "failed to map sgt, ret = %d.\n", ret);
+			dev_err(ctx->dev->dev, "failed to map SGT, ret = %d.\n", ret);
 			goto err_ioummu_map;
 		}
 	}
@@ -724,7 +725,7 @@ bool udma_alloc_u_hugepage(struct udma_context *ctx, uint64_t buf_addr, uint32_t
 			goto unlock_mm;
 
 		if (!udma_check_vma_flags(vma)) {
-			dev_err(ctx->dev->dev, "failed to check vma flags.\n");
+			dev_err(ctx->dev->dev, "failed to check VMA flags.\n");
 			goto unlock_mm;
 		}
 
@@ -749,7 +750,7 @@ void udma_free_u_hugepage(struct udma_context *ctx, uint64_t buf_addr)
 	priv = udma_list_find_before(ctx, buf_addr);
 	if (!priv) {
 		mutex_unlock(&ctx->hugepage_lock);
-		dev_warn(ctx->dev->dev, "buf_addr is invalid addr.\n");
+		dev_warn(ctx->dev->dev, "buffer address is invalid address.\n");
 		return;
 	}
 

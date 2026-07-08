@@ -11,12 +11,13 @@
 
 #include <linux/jhash.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 
 #include <ub/urma/ubcore_types.h>
 #include <ub/urma/ubcore_uapi.h>
 #include "ubcore_log.h"
-#include "ubmgr_topo.h"
+#include "ubcore_main_ue_eid.h"
 
 #include "ubmgr_ping.h"
 
@@ -41,6 +42,8 @@ struct ubmgr_ping_ctx {
 	struct workqueue_struct *wq;
 	struct hlist_head tjetty_hlist[PING_TJETTY_HASH_SIZE];
 	spinlock_t tjetty_lock;
+	spinlock_t wq_lock; /* protects wq pointer + queue_work */
+	bool wq_stopped; /* blocks queue_work during jetty teardown */
 };
 
 /* Hash func */
@@ -60,6 +63,7 @@ static struct ubmgr_ping_tjetty_entry *
 __ping_tjetty_new_entry(struct ubcore_device *dev, union ubcore_eid *dst_eid,
 			uint32_t eid_index, uint32_t remote_jetty_id)
 {
+	struct ubmgr_ping_tjetty_entry *entry = NULL;
 	struct ubcore_tjetty_cfg cfg = {
 		.id.eid = *dst_eid,
 		.id.id = remote_jetty_id,
@@ -70,15 +74,15 @@ __ping_tjetty_new_entry(struct ubcore_device *dev, union ubcore_eid *dst_eid,
 	};
 	struct ubcore_tjetty *tjetty = NULL;
 
-	tjetty = ubcore_import_jetty(dev, &cfg, NULL);
-	if (IS_ERR_OR_NULL(tjetty))
-		return ERR_CAST(tjetty);
-
-	struct ubmgr_ping_tjetty_entry *entry = NULL;
-
 	entry = kzalloc(sizeof(struct ubmgr_ping_tjetty_entry), GFP_KERNEL);
 	if (entry == NULL)
 		return ERR_PTR(-ENOMEM);
+
+	tjetty = ubcore_import_jetty(dev, &cfg, NULL);
+	if (IS_ERR_OR_NULL(tjetty)) {
+		kfree(entry);
+		return ERR_CAST(tjetty);
+	}
 
 	entry->tjetty = tjetty;
 	kref_init(&entry->kref);
@@ -95,14 +99,14 @@ void __ping_tjetty_free_entry(struct kref *kref)
 
 static struct ubmgr_ping_tjetty_entry *
 __ping_tjetty_find(struct hlist_head *bucket, union ubcore_eid *dst_eid,
-			uint32_t remote_id)
+		   uint32_t remote_id)
 {
 	struct ubmgr_ping_tjetty_entry *entry = NULL;
 
 	hlist_for_each_entry(entry, bucket, node) {
 		if (memcmp(&entry->tjetty->cfg.id.eid, dst_eid,
 			   sizeof(union ubcore_eid)) == 0 &&
-			   entry->tjetty->cfg.id.id == remote_id) {
+		    entry->tjetty->cfg.id.id == remote_id) {
 			kref_get(&entry->kref);
 			return entry;
 		}
@@ -156,7 +160,8 @@ ping_tjetty_find_or_create(struct ubmgr_ping_ctx *ctx,
 	}
 
 	entry = __ping_tjetty_new_entry(ctx->jetty->ub_dev, dst_eid,
-					ctx->jetty->jetty_cfg.eid_index, remote_id);
+					ctx->jetty->jetty_cfg.eid_index,
+					remote_id);
 	if (IS_ERR_OR_NULL(entry)) {
 		ubcore_log_err("Failed to import tjetty. eid " EID_FMT "\n",
 			       EID_ARGS(*dst_eid));
@@ -185,15 +190,15 @@ static void ping_tjetty_put(struct ubmgr_ping_ctx *ctx,
 	bool last = false;
 
 	spin_lock_irqsave(&ctx->tjetty_lock, flag);
-	if (kref_read(&entry->kref) == 1) {
+	last = refcount_dec_and_test(&entry->kref.refcount);
+	if (last)
 		hlist_del(&entry->node);
-		last = true;
-	}
 	spin_unlock_irqrestore(&ctx->tjetty_lock, flag);
 
-	kref_put(&entry->kref, __ping_tjetty_free_entry);
-	if (last)
+	if (last) {
+		__ping_tjetty_free_entry(&entry->kref);
 		kfree(entry);
+	}
 }
 
 static void ping_tjetty_clear(struct ubmgr_ping_ctx *ctx)
@@ -206,6 +211,30 @@ static void ping_tjetty_htable_init(struct ubmgr_ping_ctx *ctx)
 {
 	for (int i = 0; i < PING_TJETTY_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&ctx->tjetty_hlist[i]);
+}
+
+static int ping_find_eid_by_main_ue_eid(const union ubcore_eid *main_ue_eid,
+					struct ubcore_device *dev,
+					struct ubcore_eid_info *eid_info)
+{
+	int i;
+
+	spin_lock(&dev->eid_table.lock);
+	for (i = 0; i < dev->eid_table.eid_cnt; i++) {
+		if (!dev->eid_table.eid_entries[i].valid)
+			continue;
+
+		if (memcmp(&dev->eid_table.eid_entries[i].eid, main_ue_eid,
+			   UBCORE_EID_SIZE) == 0) {
+			eid_info->eid = dev->eid_table.eid_entries[i].eid;
+			eid_info->eid_index =
+				dev->eid_table.eid_entries[i].eid_index;
+			spin_unlock(&dev->eid_table.lock);
+			return 0;
+		}
+	}
+	spin_unlock(&dev->eid_table.lock);
+	return -EINVAL;
 }
 
 /* Workqueue func */
@@ -253,7 +282,8 @@ static void ping_wq_on_recved(struct ubmgr_ping_ctx *ctx, struct ubcore_cr *cr)
 
 	struct ubmgr_ping_tjetty_entry *entry;
 
-	entry = ping_tjetty_find_or_create(ctx, &cr->remote_id.eid, cr->remote_id.id);
+	entry = ping_tjetty_find_or_create(ctx, &cr->remote_id.eid,
+					   cr->remote_id.id);
 	if (IS_ERR_OR_NULL(entry)) {
 		ubcore_log_err("Failed to get tjetty for remote_id\n");
 		goto refill;
@@ -268,6 +298,12 @@ static void ping_wq_on_recved(struct ubmgr_ping_ctx *ctx, struct ubcore_cr *cr)
 	}
 	resp_ctx->entry = entry;
 	resp_ctx->sge_addr = cr->user_ctx;
+
+	ubcore_log_info_rl("Ping recv, src_eid=" EID_FMT ", dst_eid=" EID_FMT
+			   ", comp_len=%u.\n",
+			   EID_ARGS(cr->remote_id.eid),
+			   EID_ARGS(ctx->jetty->jetty_id.eid),
+			   cr->completion_len);
 
 	struct ubcore_sge sge = {
 		.addr = cr->user_ctx,
@@ -289,6 +325,7 @@ static void ping_wq_on_recved(struct ubmgr_ping_ctx *ctx, struct ubcore_cr *cr)
 	ret = ubcore_post_jetty_send_wr(ctx->jetty, &wr, &bad_wr);
 	if (ret != 0) {
 		ping_tjetty_put(ctx, entry);
+		kfree(resp_ctx);
 		ubcore_log_err("Fail to post send wr, ret:%d\n", ret);
 		goto refill;
 	}
@@ -304,7 +341,19 @@ static void ping_wq_on_sended(struct ubmgr_ping_ctx *ctx, struct ubcore_cr *cr)
 		ubcore_log_err("Tx status error. status %d, comp_len %u.\n",
 			       cr->status, cr->completion_len);
 
-	struct ubmgr_ping_resp_ctx *resp_ctx = (struct ubmgr_ping_resp_ctx *)cr->user_ctx;
+	if (cr->status == UBCORE_CR_WR_FLUSH_ERR_DONE || cr->user_ctx == 0) {
+		ubcore_log_err("Send WR flushed or cr user_ctx is NULL.\n");
+		return;
+	}
+
+	struct ubmgr_ping_resp_ctx *resp_ctx =
+		(struct ubmgr_ping_resp_ctx *)cr->user_ctx;
+
+	ubcore_log_info_rl("Ping send, src_eid=" EID_FMT ", dst_eid=" EID_FMT
+			   ", comp_len=%u.\n",
+			   EID_ARGS(ctx->jetty->jetty_id.eid),
+			   EID_ARGS(resp_ctx->entry->tjetty->cfg.id.eid),
+			   cr->completion_len);
 
 	ping_tjetty_put(ctx, resp_ctx->entry);
 	ping_refill_recv_wr(ctx, resp_ctx->sge_addr);
@@ -378,15 +427,14 @@ static void ping_send_work_handler(struct work_struct *w)
 static int ping_wq_queue_work(struct ubcore_jfc *jfc,
 			      void (*handler)(struct work_struct *))
 {
-	int ret;
-
 	struct ubmgr_ping_ctx *ctx;
+
+	struct ubmgr_ping_work *pwork;
+	unsigned long flags;
 
 	ctx = ubcore_get_client_ctx_data(jfc->ub_dev, &g_ping_client);
 	if (IS_ERR_OR_NULL(ctx))
 		return -EINVAL;
-
-	struct ubmgr_ping_work *pwork;
 
 	pwork = kzalloc(sizeof(struct ubmgr_ping_work), GFP_ATOMIC);
 	if (pwork == NULL)
@@ -396,11 +444,22 @@ static int ping_wq_queue_work(struct ubcore_jfc *jfc,
 	pwork->jfc = jfc;
 	pwork->ctx = ctx;
 
-	ret = queue_work(pwork->ctx->wq, &pwork->work);
-	if (ret < 0) {
+	/*
+	 * Hold wq_lock across state-check + queue_work so teardown cannot
+	 * race between the check and queueing a new work item.
+	 */
+	spin_lock_irqsave(&ctx->wq_lock, flags);
+	if (!ctx->wq || ctx->wq_stopped) {
+		spin_unlock_irqrestore(&ctx->wq_lock, flags);
 		kfree(pwork);
-		return ret;
+		return -ESHUTDOWN;
 	}
+	if (!queue_work(ctx->wq, &pwork->work)) {
+		spin_unlock_irqrestore(&ctx->wq_lock, flags);
+		kfree(pwork);
+		return -EBUSY;
+	}
+	spin_unlock_irqrestore(&ctx->wq_lock, flags);
 	return 0;
 }
 
@@ -569,11 +628,59 @@ unregister_seg:
 
 static void ping_ctx_uninit_jetty(struct ubmgr_ping_ctx *ctx)
 {
-	ubcore_delete_jetty(ctx->jetty);
-	ubcore_delete_jfr(ctx->jfr);
-	ubcore_delete_jfc(ctx->recv_jfc);
-	ubcore_delete_jfc(ctx->send_jfc);
-	ubcore_unregister_seg(ctx->seg);
+	if (ctx->jetty != NULL) {
+		ubcore_delete_jetty(ctx->jetty);
+		ctx->jetty = NULL;
+	}
+
+	if (ctx->jfr != NULL) {
+		ubcore_delete_jfr(ctx->jfr);
+		ctx->jfr = NULL;
+	}
+
+	if (ctx->recv_jfc != NULL) {
+		ubcore_delete_jfc(ctx->recv_jfc);
+		ctx->recv_jfc = NULL;
+	}
+
+	if (ctx->send_jfc != NULL) {
+		ubcore_delete_jfc(ctx->send_jfc);
+		ctx->send_jfc = NULL;
+	}
+
+	if (ctx->seg != NULL) {
+		ubcore_unregister_seg(ctx->seg);
+		ctx->seg = NULL;
+	}
+}
+
+static struct workqueue_struct *ping_stop_wq(struct ubmgr_ping_ctx *ctx,
+					     bool detach)
+{
+	struct workqueue_struct *wq;
+	unsigned long flags;
+
+	/* Stop new ping work before draining in-flight handlers. */
+	spin_lock_irqsave(&ctx->wq_lock, flags);
+	wq = ctx->wq;
+	ctx->wq_stopped = true;
+	if (detach)
+		ctx->wq = NULL;
+	spin_unlock_irqrestore(&ctx->wq_lock, flags);
+
+	if (wq != NULL)
+		drain_workqueue(wq);
+
+	return wq;
+}
+
+static void ping_start_wq(struct ubmgr_ping_ctx *ctx)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ctx->wq_lock, flags);
+	ctx->wq_stopped = false;
+	spin_unlock_irqrestore(&ctx->wq_lock, flags);
 }
 
 static int ping_on_add_device(struct ubcore_device *dev)
@@ -593,6 +700,7 @@ static int ping_on_add_device(struct ubcore_device *dev)
 
 	mutex_init(&ping_ctx->init_mutex);
 	spin_lock_init(&ping_ctx->tjetty_lock);
+	spin_lock_init(&ping_ctx->wq_lock);
 	ping_tjetty_htable_init(ping_ctx);
 	ping_ctx->wq = alloc_workqueue(
 		"ping_wq", WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_FREEZABLE, 0);
@@ -601,29 +709,9 @@ static int ping_on_add_device(struct ubcore_device *dev)
 		goto free_buf;
 	}
 
-	struct ubcore_eid_info eid_info = { 0 };
-
-	if (ubmgr_get_first_primary_eid(dev, &eid_info) != 0) {
-		ubcore_log_info(
-			"Primary eid not found, init deferred, dev:%s\n",
-			dev->dev_name);
-		goto complete;
-	}
-
-	ret = ping_ctx_init_jetty(dev, ping_ctx, eid_info.eid_index);
-	if (ret != 0) {
-		ubcore_log_err("Failed to init ping ctx, dev:%s, ret=%d\n",
-			       dev->dev_name, ret);
-		goto destroy_wq;
-	}
-
-complete:
 	ubcore_set_client_ctx_data(dev, &g_ping_client, ping_ctx);
 	return 0;
 
-destroy_wq:
-	destroy_workqueue(ping_ctx->wq);
-	mutex_destroy(&ping_ctx->init_mutex);
 free_buf:
 	vfree(ping_ctx->buf);
 free_ctx:
@@ -634,18 +722,18 @@ free_ctx:
 static void ping_on_remove_device(struct ubcore_device *dev, void *client_ctx)
 {
 	struct ubmgr_ping_ctx *ping_ctx = client_ctx;
+	struct workqueue_struct *wq;
 
 	if (ping_ctx == NULL)
 		return;
 
-	// Ensure all work are completed and no more work will be queued
-	drain_workqueue(ping_ctx->wq);
-	flush_workqueue(ping_ctx->wq);
+	wq = ping_stop_wq(ping_ctx, true);
 
 	ping_tjetty_clear(ping_ctx);
 	ping_ctx_uninit_jetty(ping_ctx);
 
-	destroy_workqueue(ping_ctx->wq);
+	if (wq != NULL)
+		destroy_workqueue(wq);
 	mutex_destroy(&ping_ctx->init_mutex);
 	vfree(ping_ctx->buf);
 	vfree(ping_ctx);
@@ -659,10 +747,9 @@ struct ubcore_client g_ping_client = {
 	.stop = NULL,
 };
 
-static void ping_on_event(enum ubmgr_event_type event_type, void *event_data,
-			  void *priv)
+static void ping_try_init_ctx(const union ubcore_eid *main_ue_eid,
+			      struct ubcore_device *dev)
 {
-	struct ubcore_device *dev = (struct ubcore_device *)event_data;
 	struct ubmgr_ping_ctx *ping_ctx;
 	int ret;
 
@@ -680,7 +767,7 @@ static void ping_on_event(enum ubmgr_event_type event_type, void *event_data,
 	}
 	struct ubcore_eid_info eid_info = { 0 };
 
-	if (ubmgr_get_first_primary_eid(dev, &eid_info) != 0) {
+	if (ping_find_eid_by_main_ue_eid(main_ue_eid, dev, &eid_info) != 0) {
 		ubcore_log_info(
 			"Primary eid not found, init deferred, dev:%s\n",
 			dev->dev_name);
@@ -696,21 +783,73 @@ static void ping_on_event(enum ubmgr_event_type event_type, void *event_data,
 	mutex_unlock(&ping_ctx->init_mutex);
 }
 
-struct ubmgr_event_notifier notifier = {
-	.cb = ping_on_event,
-	.priv = NULL,
-	.node = LIST_HEAD_INIT(notifier.node),
-};
+static void ping_try_uninit_ctx(struct ubcore_device *dev)
+{
+	struct ubmgr_ping_ctx *ping_ctx;
+
+	ping_ctx = ubcore_get_client_ctx_data(dev, &g_ping_client);
+	if (IS_ERR_OR_NULL(ping_ctx)) {
+		ubcore_log_err("Failed to get ping client ctx, dev:%s\n",
+			       dev->dev_name);
+		return;
+	}
+
+	mutex_lock(&ping_ctx->init_mutex);
+	if (ping_ctx->jetty == NULL) {
+		mutex_unlock(&ping_ctx->init_mutex);
+		return;
+	}
+
+	/* LAST_DEL tears down ping jetty resources until a later FIRST_ADD. */
+	(void)ping_stop_wq(ping_ctx, false);
+	ping_tjetty_clear(ping_ctx);
+	ping_ctx_uninit_jetty(ping_ctx);
+	ping_start_wq(ping_ctx);
+	mutex_unlock(&ping_ctx->init_mutex);
+}
+
+static void
+ping_on_main_ue_eid_event(const union ubcore_eid *main_ue_eid,
+			  enum ubcore_main_ue_eid_event_type event_type)
+{
+	struct ubcore_device *dev;
+
+	dev = ubcore_get_device_by_eid((union ubcore_eid *)main_ue_eid,
+				       UBCORE_TRANSPORT_UB);
+	if (dev == NULL)
+		return;
+
+	switch (event_type) {
+	case UBCORE_MAIN_UE_EID_FIRST_ADD:
+		ping_try_init_ctx(main_ue_eid, dev);
+		break;
+	case UBCORE_MAIN_UE_EID_LAST_DEL:
+		ping_try_uninit_ctx(dev);
+		break;
+	default:
+		break;
+	}
+
+	ubcore_put_device(dev);
+}
 
 int ubmgr_ping_init(void)
 {
 	int ret;
 
-	ubmgr_register_event_notifier(&notifier);
+	ret = ubcore_register_main_ue_eid_event_cb(ping_on_main_ue_eid_event);
+	if (ret != 0) {
+		ubcore_log_err(
+			"Failed to register main ue eid event cb, ret=%d\n",
+			ret);
+		return ret;
+	}
 
 	ret = ubcore_register_client(&g_ping_client);
 	if (ret != 0) {
 		ubcore_log_err("Failed to register ping client, ret=%d\n", ret);
+		(void)ubcore_unregister_main_ue_eid_event_cb(
+			ping_on_main_ue_eid_event);
 		return ret;
 	}
 
@@ -720,5 +859,5 @@ int ubmgr_ping_init(void)
 void ubmgr_ping_uninit(void)
 {
 	ubcore_unregister_client(&g_ping_client);
-	ubmgr_unregister_event_notifier(&notifier);
+	(void)ubcore_unregister_main_ue_eid_event_cb(ping_on_main_ue_eid_event);
 }
