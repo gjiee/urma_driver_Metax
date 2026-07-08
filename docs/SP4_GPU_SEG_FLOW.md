@@ -83,11 +83,13 @@ udma_ioummu_remote_map / udma_iommu_local_map
 | 文件 | 作用 |
 |------|------|
 | `urma/hw/udma/udma_gpu_p2p.h` | `struct udma_register_seg_ucmd`（wire 格式）、`udma_seg_ucmd_is_gpu()`（从 udrv_data 解析）、`udma_seg_cfg_is_gpu()`（内部判定）、内部私有位 `UBCORE_REG_SEG_GPU_VA` |
-| `urma/hw/udma/udma_gpu_p2p.c` | NV P2P pin/unpin + SG 构建 |
+| `urma/hw/udma/udma_gpu_p2p.c` | GPU pin/unpin 主逻辑 + 本地 SG 构建；调用 `udma_nv_p2p_bridge.ko` 的 wrapper，不直接碰 `nvidia_p2p_*` |
+| `urma/hw/udma/udma_nv_p2p_bridge.h` | 桥接模块对外暴露的 wrapper 函数声明（`udma_nv_p2p_get_pages`/`put_pages`/`free_page_table`） |
+| `urma/hw/udma/udma_nv_p2p_bridge.c` | **独立 `.ko`**，`MODULE_LICENSE("Dual BSD/GPL")`，直接静态链接 `nvidia.ko`，`EXPORT_SYMBOL` 自己的 wrapper |
 | `urma/hw/udma/udma_segment.h` | GPU 段结构体扩展（`is_gpu_seg`、`struct udma_gpu_p2p_mem gpu`） |
 | `urma/hw/udma/udma_segment.c` | `udma_register_seg()` 入口处从 `udata` 解析 GPU 标记并打到本地 `cfg`；`udma_init_seg_cfg` / `udma_pin_pages_and_ioummu_map` / legacy 路径 / `udma_unpin_seg_pages` 分流不变 |
-| `urma/hw/udma/udma_main.c` | `MODULE_SOFTDEP("pre: nvidia")` |
-| `urma/hw/udma/Makefile` | 编译 `udma_gpu_p2p.o`，`ccflags -I$(NV_P2P_HEADER_PATH)` |
+| `urma/hw/udma/udma_main.c` | `MODULE_SOFTDEP("pre: udma_nv_p2p_bridge")` |
+| `urma/hw/udma/Makefile` | 编译 `udma.ko`（含 `udma_gpu_p2p.o`）**和** `udma_nv_p2p_bridge.ko` 两个 `obj-m` 目标，`ccflags -I$(NV_P2P_HEADER_PATH)` |
 | `urma/Makefile` | OOT 独立编译 `urma/` 支持（`NV_P2P_HEADER_PATH`/`NV_MODULE_SYMVERS`） |
 | `Makefile`（根） | OOT 整树编译支持 |
 
@@ -134,7 +136,7 @@ SG 表不再依赖 NV 侧任何符号，`udma_gpu_build_sg_table()` 本地用 `p
 
 - URMA/UB 总线不是 PCI 设备，**不能**调用 `nvidia_p2p_dma_map_pages`（需要 `struct pci_dev *peer`）。只用 `get_pages` 返回的 `physical_address` 走 UMMU 自己的表即可，这对非 PCIe 第三方总线是唯一可行路径。
 
-### 4.1 换成经典 API 之后仍然 `Unknown symbol`？—— GPL/proprietary 边界 + symbol_get() 修复
+### 4.1 换成经典 API 之后仍然 `Unknown symbol`？—— GPL/proprietary 边界，切独立 Dual BSD/GPL 桥接模块
 
 换成 `nvidia_p2p_get_pages`/`put_pages`/`free_page_table` 之后，在真实闭源驱动上依然报：
 
@@ -143,31 +145,34 @@ udma: module using GPL-only symbols uses symbols nvidia_p2p_get_pages from propr
 udma: Unknown symbol nvidia_p2p_get_pages (err -2)
 ```
 
-用 `cat /proc/kallsyms | grep nvidia_p2p_get_pages` 能确认符号**确实存在**于已加载的 `nvidia.ko`（`T nvidia_p2p_get_pages [nvidia]`，还有对应的 `__crc_`/`__ksymtab_` 项）。
+用 `cat /proc/kallsyms | grep nvidia_p2p_get_pages` 能确认符号**确实存在**于已加载的 `nvidia.ko`（`T nvidia_p2p_get_pages [nvidia]`，还有对应的 `__crc_`/`__ksymtab_` 项）——排除了"符号真的不存在"这个可能。
 
-原因：`udma.ko` 是 `MODULE_LICENSE("GPL")`，`nvidia.ko` 是 proprietary（`TAINT_PROPRIETARY_MODULE`）。`insmod` 阶段对这类跨 GPL/proprietary 边界的符号做**静态解析**——既要 GPL taint 判定通过，在 `CONFIG_MODVERSIONS` 开启时（这台机器 `vermagic` 里有 `modversions`）还要 CRC 完全匹配。任何一处不满足，内核给的报错**统一都是** `Unknown symbol X (err -2)`，没法从报错本身区分到底是 taint 问题还是 CRC 不匹配。
+原因：`udma.ko` 是 `MODULE_LICENSE("GPL")`，`nvidia.ko` 是 proprietary（`TAINT_PROPRIETARY_MODULE`）。让纯 GPL 模块直接静态链接 proprietary 模块的符号，`insmod` 阶段的符号解析（GPL taint 判定 + `CONFIG_MODVERSIONS` 开启时的 CRC 校验，这台机器 `vermagic` 里有 `modversions`）不干净，报错统一都是 `Unknown symbol X (err -2)`，没法从报错本身区分具体原因。
 
-**修复（当前分支已采用）**：不让 `insmod` 做静态符号解析，改用内核标准的 `symbol_get()`/`symbol_put()` 在运行时动态从 `kallsyms` 查函数地址：
+**修复（当前分支已采用，参照传统 RDMA 厂商模式）**：Mellanox `nvidia-peermem.ko` 本身就不是纯 GPL，而是 `MODULE_LICENSE("Dual BSD/GPL")`——这正是业界验证了十几年的标准做法：**专门切一个独立的小模块负责直接链接 proprietary 驱动的符号，License 用 Dual BSD/GPL，让真正的 RDMA 网卡驱动（这里是 udma.ko）完全不碰 proprietary 符号，只依赖这个自己完全掌控的桥接模块。**
+
+新增 `udma_nv_p2p_bridge.ko`：
 
 ```c
-typedef typeof(nvidia_p2p_get_pages) *udma_fn_nvidia_p2p_get_pages_t;
+// udma_nv_p2p_bridge.c
+MODULE_LICENSE("Dual BSD/GPL");   // 跟 nvidia-peermem.c 一模一样
 
-udma_fn_nvidia_p2p_get_pages_t get_pages =
-    (udma_fn_nvidia_p2p_get_pages_t)symbol_get(nvidia_p2p_get_pages);
-if (!get_pages) {
-    /* nvidia.ko 未加载，或者这台机器的驱动确实不导出这个符号 */
+int udma_nv_p2p_get_pages(uint64_t gpu_va, uint64_t length,
+			  struct nvidia_p2p_page_table **page_table,
+			  void (*free_callback)(void *data), void *data)
+{
+	return nvidia_p2p_get_pages(0, 0, gpu_va, length, page_table,
+				    free_callback, data);
 }
-...
-ret = get_pages(0, 0, gpu_va, len, &page_table, callback, data);
-...
-symbol_put(nvidia_p2p_get_pages);
+EXPORT_SYMBOL(udma_nv_p2p_get_pages);
+// ... put_pages / free_page_table 同理
 ```
 
-`symbol_get()` 宏内部把符号声明成 `__attribute__((weak))`，且只把符号名以**字符串**传给 `__symbol_get()`（内部走 `find_symbol()`），代码里从头到尾不出现对 `nvidia_p2p_get_pages(...)` 的直接函数调用——`udma_gpu_p2p.o` 里不会有任何针对这个符号名的 ELF 重定位项，`insmod udma.ko` 阶段**完全不要求这些符号存在**，查不到就在 `register_seg` 时返回错误，不会导致整个模块加载失败。
+`udma.ko`（纯 GPL）里的 `udma_gpu_p2p.c` 只调 `udma_nv_p2p_get_pages()`/`udma_nv_p2p_put_pages()`/`udma_nv_p2p_free_page_table()` 这几个我们自己的 wrapper 符号——因为 `udma_nv_p2p_bridge.ko` 和 `udma.ko` 是同一个 `urma/hw/udma/Makefile` 里的两个 `obj-m` 目标，在**同一次** kbuild/modpost 里一起编译，彼此的符号互相可见，不需要额外的 `KBUILD_EXTRA_SYMBOLS` 拼接，CRC 天然一致（我们自己同时编两个 `.ko`，不存在"跨仓库/跨编译批次"的版本错配问题）。
 
-另外，内核里 `__symbol_get()` 本身对 GPL-only 符号是无条件放行的（`find_symbol(..., gplok=true, ...)`，硬编码 `true`），不看调用方模块的 license——这比静态解析更宽松，天然绕开了 GPL taint 判定的坑。
+真正触碰 `nvidia.ko` proprietary 符号、需要 `NV_MODULE_SYMVERS`/`KBUILD_EXTRA_SYMBOLS` 静态链接的，只剩 `udma_nv_p2p_bridge.ko` 这一个模块——它复刻的正是 `nvidia-peermem.ko` 已经验证过的 license 组合，静态解析理应正常工作。
 
-代价（已知简化，见 `udma_gpu_p2p.c` 文件头注释）：目前是"每次调用现取现还"，不是在整个 pin 期间常驻持有 `nvidia.ko` 的引用计数，理论上 `nvidia.ko` 可能在 pin 和 unpin 之间被 `rmmod`——暂不处理。
+加载顺序变成三级：`nvidia.ko` → `udma_nv_p2p_bridge.ko` → `udma.ko`（`udma_main.c` 的 `MODULE_SOFTDEP` 只声明了对 `udma_nv_p2p_bridge` 的直接依赖，`nvidia` 那一跳由 `udma_nv_p2p_bridge.ko` 自己的 `MODULE_SOFTDEP("pre: nvidia")` 负责；`softdep` 只有 `modprobe` 认，`insmod` 需要手动按顺序）。
 
 ---
 
@@ -186,4 +191,12 @@ cd urma
 make NV_P2P_HEADER_PATH=... NV_MODULE_SYMVERS=...
 ```
 
-加载顺序：`insmod nvidia.ko` → `insmod udma.ko`（`MODULE_SOFTDEP` 已声明，多数发行版 `modprobe` 会自动处理）。
+加载顺序（三级）：
+
+```bash
+insmod nvidia.ko
+insmod urma/hw/udma/udma_nv_p2p_bridge.ko
+insmod urma/hw/udma/udma.ko
+```
+
+`MODULE_SOFTDEP` 已经在各自模块里声明好依赖关系，用 `modprobe` 会自动处理；`insmod` 需要手动按上面顺序。

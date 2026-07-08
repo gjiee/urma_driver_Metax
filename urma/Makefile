@@ -22,12 +22,16 @@ all: modules
 
 check-nv-symvers:
 	@test -f "$(NV_P2P_HEADER_PATH)/nv-p2p.h" || { \
-		echo "ERROR: nv-p2p.h not found under $(NV_P2P_HEADER_PATH) (needed for struct/type defs)"; exit 1; }
-	@test -f "$(NV_MODULE_SYMVERS)" && \
-		echo "NV_MODULE_SYMVERS found (optional now, udma_gpu_p2p.c resolves nvidia_p2p_* via symbol_get() at runtime, not static link)" || \
-		echo "NV_MODULE_SYMVERS not found ($(NV_MODULE_SYMVERS)) — OK, not required anymore"
+		echo "ERROR: nv-p2p.h not found under $(NV_P2P_HEADER_PATH)"; exit 1; }
+	@test -f "$(NV_MODULE_SYMVERS)" || { \
+		echo "ERROR: $(NV_MODULE_SYMVERS) not found"; \
+		echo "  Needed by udma_nv_p2p_bridge.ko (Dual BSD/GPL bridge module" \
+		     "that directly links nvidia.ko; udma.ko itself does not)."; \
+		exit 1; }
+	@grep -q nvidia_p2p_get_pages "$(NV_MODULE_SYMVERS)" || { \
+		echo "ERROR: nvidia_p2p_get_pages not found in $(NV_MODULE_SYMVERS)"; exit 1; }
 
-EXTRA_KBUILD_SYMVERS := $(wildcard $(NV_MODULE_SYMVERS)) $(if $(wildcard $(UBASE_MODULE_SYMVERS)),$(abspath $(UBASE_MODULE_SYMVERS)),)
+EXTRA_KBUILD_SYMVERS := $(abspath $(NV_MODULE_SYMVERS)) $(if $(wildcard $(UBASE_MODULE_SYMVERS)),$(abspath $(UBASE_MODULE_SYMVERS)),)
 
 modules: check-nv-symvers
 	mkdir -p $(BUILD_DIR)

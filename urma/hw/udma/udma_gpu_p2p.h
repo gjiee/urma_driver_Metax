@@ -86,16 +86,20 @@ static inline bool udma_seg_ucmd_is_gpu(struct ubcore_udata *udata)
  * (build_sg_table_phys 本来就是本项目在开源 fork 里自己加的；
  *  *_persistent 系列在你这版闭源驱动上同样未导出/不可用)。
  *
- * 改用 NVIDIA 从最早期 GPUDirect RDMA 起就一直稳定导出、
- * nvidia-peermem.ko 用了十几年的经典 API：
- *   nvidia_p2p_get_pages(p2p_token=0, va_space=0, va, len,
- *                        &page_table, free_callback, data)
- *   nvidia_p2p_put_pages(p2p_token=0, va_space=0, va, page_table)
- * 唯一区别: 必须传一个非 NULL 的 free_callback，NV 在 GPU 内存被
- * App 提前释放（这段还没 unregister）时异步调用它。
+ * 换成 NVIDIA 从最早期 GPUDirect RDMA 起就一直稳定导出、
+ * nvidia-peermem.ko 用了十几年的经典 API（get_pages/put_pages）之后，
+ * 依然 "Unknown symbol" —— 这次是因为 udma.ko 是纯 GPL，nvidia.ko 是
+ * proprietary，跨这个边界的静态符号解析（GPL taint + CONFIG_MODVERSIONS
+ * CRC 校验）不干净。
+ *
+ * 修复: 参照传统 RDMA 厂商模式（Mellanox nvidia-peermem.ko 本身就是
+ * MODULE_LICENSE("Dual BSD/GPL")，不是纯 GPL），单独切一个 Dual BSD/GPL
+ * 的 udma_nv_p2p_bridge.ko 专门直接链接 nvidia.ko 的符号，udma.ko 只依赖
+ * 这个我们自己完全掌控的桥接模块（见 udma_nv_p2p_bridge.h）。
  *
  * SG 表不再指望 NV 侧提供，直接在 udma_gpu_p2p.c 里用
- * page_table->pages[i]->physical_address（公开稳定 ABI 字段）自己拼。
+ * page_table->pages[i]->physical_address（公开稳定 ABI 字段）自己拼——
+ * 这是纯结构体字段读取，不涉及符号链接，留在 udma.ko 里没有 license 问题。
  */
 
 //GPU兼容测试补丁: NVIDIA P2P 仅支持 64KB 页，与 NVIDIA_P2P_PAGE_SIZE_64KB 一致
@@ -142,7 +146,8 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 
 /*
  * GPU兼容测试补丁: 释放 GPU pin 与 SG
- * @seg: 必须 is_gpu_seg；调用 nvidia_p2p_put_pages + sg_free_table
+ * @seg: 必须 is_gpu_seg；调用 udma_nv_p2p_put_pages（经桥接模块转发到
+ *       nvidia_p2p_put_pages）+ sg_free_table
  */
 void udma_gpu_unpin_seg_pages(struct udma_segment *seg);
 
