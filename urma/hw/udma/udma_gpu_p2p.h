@@ -35,8 +35,18 @@
 #include "udma_dev.h"
 #include "udma_segment.h"
 
-//GPU兼容测试补丁: 1=启用本文件 API；0=编译为空 stub 返回 -ENOTSUPP
+/*
+ * GPU兼容测试补丁: 1=启用本文件 API（需要 nv-p2p.h，即 NV_P2P_HEADER_PATH
+ * 指向的目录存在）；0=编译为空 stub 返回 -ENOTSUPP，完全不需要任何
+ * NVIDIA 头文件，用于没有 GPU/没装 NVIDIA 驱动源码的机器（比如只做
+ * client 端、没有 GPU 的对端节点）也能编译出同一份 udma.ko。
+ *
+ * 默认 1（保持原行为）；OOT Makefile 在检测不到 nv-p2p.h 时，会通过
+ * ccflags-y += -DUDMA_GPU_P2P_ENABLE=0 覆盖成 0，见 urma/hw/udma/Makefile。
+ */
+#ifndef UDMA_GPU_P2P_ENABLE
 #define UDMA_GPU_P2P_ENABLE	1
+#endif
 
 /*
  * GPU兼容测试补丁: udma.ko 内部私有标记位，仅用于 udma_register_seg()

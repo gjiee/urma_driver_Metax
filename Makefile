@@ -22,23 +22,28 @@ show-vars:
 		echo "ERROR: nv-p2p.h not at $(NV_P2P_HEADER_PATH)/nv-p2p.h"
 	@echo "NV_MODULE_SYMVERS=$(NV_MODULE_SYMVERS)"
 
+# FIX: 同 urma/Makefile —— 没有 GPU 的机器（比如跨节点测试里不带 GPU
+# 的对端）现在也要能编译出跟带 GPU 那台节点版本一致的整套模块，NV 相关
+# 检查从"缺了就 exit 1"改成"缺了就 WARNING + 自动禁用 GPU P2P"，不再
+# 阻塞整个编译。
+HAVE_NV_P2P_HEADER := $(if $(wildcard $(NV_P2P_HEADER_PATH)/nv-p2p.h),1,0)
+HAVE_NV_SYMVERS := $(if $(and $(filter 1,$(HAVE_NV_P2P_HEADER)),$(wildcard $(NV_MODULE_SYMVERS))),1,0)
+
 modules:
-	@test -f "$(NV_P2P_HEADER_PATH)/nv-p2p.h" || { \
-		echo "ERROR: nv-p2p.h not found under $(NV_P2P_HEADER_PATH)"; \
-		echo "  Use: NV_P2P_HEADER_PATH=/path/to/nv-p2p-header-dir"; \
-		exit 1; }
-	@test -f "$(NV_MODULE_SYMVERS)" || { \
-		echo "ERROR: Module.symvers not found: $(NV_MODULE_SYMVERS)"; \
-		echo "  Needed by udma_nv_p2p_bridge.ko, the Dual BSD/GPL bridge module"; \
-		echo "  that directly links nvidia.ko (udma.ko itself no longer does)."; \
-		echo "  Point NV_MODULE_SYMVERS at your nvidia.ko build's Module.symvers"; \
-		exit 1; }
+ifeq ($(HAVE_NV_P2P_HEADER),0)
+	@echo "WARNING: nv-p2p.h not found under $(NV_P2P_HEADER_PATH)."
+	@echo "  Building WITHOUT GPU P2P support (UDMA_GPU_P2P_ENABLE=0);"
+	@echo "  udma_nv_p2p_bridge.ko will NOT be built. See urma/hw/udma/Makefile."
+else
+	@test -f "$(NV_MODULE_SYMVERS)" || \
+		echo "WARNING: Module.symvers not found: $(NV_MODULE_SYMVERS); udma_nv_p2p_bridge.ko will NOT be built."
+endif
 	mkdir -p $(BUILD_DIR)
 	$(MAKE) -C $(KDIR) M=$(CURDIR) \
 		CONFIG_UB=m CONFIG_UB_UBASE=m CONFIG_UB_URMA=m CONFIG_UB_UDMA=m \
 		NV_P2P_HEADER_PATH=$(NV_P2P_HEADER_PATH) \
-		NV_MODULE_SYMVERS=$(abspath $(NV_MODULE_SYMVERS)) \
-		KBUILD_EXTRA_SYMBOLS="$(abspath $(NV_MODULE_SYMVERS))" \
+		NV_MODULE_SYMVERS=$(if $(filter 1,$(HAVE_NV_SYMVERS)),$(abspath $(NV_MODULE_SYMVERS)),) \
+		KBUILD_EXTRA_SYMBOLS="$(if $(filter 1,$(HAVE_NV_SYMVERS)),$(abspath $(NV_MODULE_SYMVERS)),)" \
 		modules
 	@find $(CURDIR) -name '*.ko' ! -path '$(BUILD_DIR)/*' -print0 | \
 		xargs -0 -r cp -t $(BUILD_DIR)/ 2>/dev/null || true
