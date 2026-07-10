@@ -48,15 +48,35 @@
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/scatterlist.h>
+
+#include "udma_gpu_p2p.h"
+#include "udma_nv_p2p_bridge.h"
+
+/*
+ * FIX: nv-p2p.h 挪到这里、且套上 #if UDMA_GPU_P2P_ENABLE —— 必须先
+ * include udma_gpu_p2p.h 才知道这个宏的值（可能被 Makefile 用
+ * -DUDMA_GPU_P2P_ENABLE=0 覆盖）。udma_nv_p2p_bridge.h 里
+ * struct nvidia_p2p_page_table 只是前置声明（forward decl），不需要
+ * nv-p2p.h 才能编译，所以上面那行不受影响，可以放在条件编译之外。
+ *
+ * 只有 udma_gpu_build_sg_table()/udma_gpu_pin_seg_pages() 这两个函数
+ * 真的会解引用 struct nvidia_p2p_page_table 的字段（entries/page_size/
+ * pages[i]->physical_address），需要完整类型定义；其余函数（注册/
+ * 反注册 ops、get/put provider 引用计数、free_callback、unpin）全程
+ * 只是传递/调用函数指针，对 nvidia_p2p_page_table 始终是"不透明指针"，
+ * 从不需要完整类型 —— 所以没有 NVIDIA 头文件的机器（比如对端没有 GPU
+ * 的 node1）也能编译出功能完整的 udma.ko，只是 GPU pin 这条路径在
+ * UDMA_GPU_P2P_ENABLE=0 时走 udma_gpu_p2p.h 里的 static inline stub
+ * (返回 -ENOTSUPP)，不影响其它任何 HOST 段功能。
+ */
+#if UDMA_GPU_P2P_ENABLE
 /*
  * 仅用于 struct nvidia_p2p_page_table/nvidia_p2p_page 的字段布局和
  * NVIDIA_P2P_PAGE_SIZE_64KB 常量 —— 纯编译期类型信息，不产生任何符号
  * 链接依赖（本文件不直接调用任何 nvidia_p2p_* 函数）。
  */
 #include <nv-p2p.h>
-
-#include "udma_gpu_p2p.h"
-#include "udma_nv_p2p_bridge.h"
+#endif
 
 /*
  * GPU兼容测试补丁: 当前注册的 GPU P2P provider（唯一，桥接模块 init
@@ -104,6 +124,19 @@ out:
 	mutex_unlock(&g_gpu_p2p_ops_lock);
 }
 EXPORT_SYMBOL(udma_unregister_gpu_p2p_ops);
+
+/*
+ * FIX: 从这里到文件末尾，全部套 #if UDMA_GPU_P2P_ENABLE —— 这些函数
+ * 要么直接 #include <nv-p2p.h> 才能解引用的字段（build_sg_table/
+ * pin_seg_pages），要么只被这两个函数调用（align_len/free_callback/
+ * ops_get/ops_put，禁用状态下没有别的调用方，留着不 gate 会变成
+ * unused-function 警告，-Werror 环境下会直接编译失败）。禁用时
+ * udma_gpu_pin_seg_pages()/udma_gpu_unpin_seg_pages() 使用
+ * udma_gpu_p2p.h 里的 static inline stub（返回 -ENOTSUPP / no-op），
+ * 所以这里不需要（也不能，会跟 static inline 重定义冲突）再定义同名
+ * 函数。
+ */
+#if UDMA_GPU_P2P_ENABLE
 
 /*
  * GPU兼容测试补丁: 取当前 provider 并 try_module_get 固定住，防止拿到
@@ -412,3 +445,5 @@ void udma_gpu_unpin_seg_pages(struct udma_segment *seg)
 
 	seg->is_gpu_seg = false;
 }
+
+#endif /* UDMA_GPU_P2P_ENABLE */
