@@ -387,7 +387,6 @@ static int udma_ioummu_remote_map(uint32_t tid,
 				  int prot)
 {
 	if (udma_seg_is_gpu(seg)) {
-		int ret;
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
 		return udma_ioummu_map_phys_sg(
 			UMMU_INVALID_TID, tid, prot,
@@ -510,7 +509,7 @@ static int udma_iommu_local_map(struct ubcore_device *ub_dev,
 		{
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
 			ret = udma_ioummu_map_phys_sg(
-				UMMU_INVALID_TID, tid, prot,
+				ctx->tid, UMMU_INVALID_TID, prot,
 				seg->addr, &seg->umem->append.sgt);
 #else
 			dev_err(ctx->dev->dev,
@@ -623,8 +622,8 @@ static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct ud
 
 err_gpu_remote_unmap:
 		if (!local_only)
-			udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
-					  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
+			udma_seg_ioummu_unmap(UMMU_INVALID_TID, tid, seg,
+				seg->addr, seg->length);
 err_gpu_pin:
 		udma_gpu_unpin_seg_pages(seg);
 		return ret;
@@ -654,8 +653,10 @@ err_gpu_pin:
 
 err_ioummu_local_map:
 	if (!local_only)
-		udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
-				  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
+		udma_seg_ioummu_unmap(UMMU_INVALID_TID, tid, seg,
+				seg->addr, seg->length);
+		//udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
+		//		  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 err_ioummu_remote_map:
 	udma_unpin_seg_pages(seg, dirty);
 
@@ -681,9 +682,22 @@ static void udma_unpin_pages_and_unioummu_map(struct udma_context *ctx, struct u
 	udma_seg_range_release(ctx, seg, &pageList);
 	current_node = pageList.head;
 	while (current_node != NULL) {
+		/*
 		udma_ioummu_unmap(ctx->tid, UMMU_INVALID_TID, current_node->start,
 				  PAGE_SIZE * udma_cal_npages(current_node->start,
 				  current_node->length));
+		current_node = current_node->next;
+		*/
+		size_t unmap_size;
+
+		unmap_size = PAGE_SIZE *
+			udma_cal_npages(current_node->start,
+				current_node->length);
+
+		udma_seg_ioummu_unmap(
+			ctx->tid, UMMU_INVALID_TID, seg,
+			current_node->start, unmap_size);
+
 		current_node = current_node->next;
 	}
 	udma_range_list_destroy(&pageList);

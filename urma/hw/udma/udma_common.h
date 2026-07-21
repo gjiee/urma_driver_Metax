@@ -19,7 +19,7 @@
 #define UDMA_REMOVE_MAX_SLEEP_TIME 800
 #define UDMA_OPEN_RX_MAX_SLEEP_TIME 3000
 #define UDMA_TIME_SLEEP_RATE 2
-
+#define CONFIG_UMMU_MATT_PHYS_SG 1
 struct udma_jetty_grp {
 	struct ubcore_jetty_group ubcore_jetty_grp;
 	uint32_t start_jetty_id;
