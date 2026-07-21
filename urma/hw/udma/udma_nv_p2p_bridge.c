@@ -28,13 +28,171 @@
 #include <nv-p2p.h>
 
 #include "udma_nv_p2p_bridge.h"
-
+/*
 static int udma_nv_p2p_bridge_get_pages(uint64_t gpu_va, uint64_t length,
 					struct nvidia_p2p_page_table **page_table,
 					void (*free_callback)(void *data), void *data)
 {
 	return nvidia_p2p_get_pages(0, 0, gpu_va, length, page_table,
 				    free_callback, data);
+}
+*/
+#define UDMA_NV_GPU_PAGE_SIZE SZ_64K
+
+static int
+udma_nv_p2p_bridge_get_pages(uint64_t gpu_va, uint64_t length,
+                             struct nvidia_p2p_page_table **page_table,
+                             void (*free_callback)(void *data),
+                             void *data)
+{
+        struct nvidia_p2p_page_table *pt;
+        uint64_t end;
+        int ret;
+
+        pr_info("UDMA NV P2P get_pages enter: "
+                "gpu_va=0x%016llx len=0x%llx "
+                "va_offset=0x%llx len_offset=0x%llx "
+                "page_table_arg=%px old_pt=%px "
+                "callback=%ps data=%px "
+                "pid=%d tgid=%d comm=%s mm=%px "
+                "interrupt=%d atomic=%d irqs_disabled=%d\n",
+                (unsigned long long)gpu_va,
+                (unsigned long long)length,
+                (unsigned long long)(gpu_va & (UDMA_NV_GPU_PAGE_SIZE - 1)),
+                (unsigned long long)(length & (UDMA_NV_GPU_PAGE_SIZE - 1)),
+                page_table,
+                page_table ? *page_table : NULL,
+                (void *)free_callback,
+                data,
+                current->pid,
+                current->tgid,
+                current->comm,
+                current->mm,
+                in_interrupt(),
+                in_atomic(),
+                irqs_disabled());
+
+        if (!page_table) {
+                pr_err("UDMA NV P2P: page_table argument is NULL\n");
+                return -EINVAL;
+        }
+
+        if (!gpu_va || !length) {
+                pr_err("UDMA NV P2P: invalid range: va=0x%llx len=0x%llx\n",
+                       (unsigned long long)gpu_va,
+                       (unsigned long long)length);
+                return -EINVAL;
+        }
+
+        end = gpu_va + length;
+        if (end < gpu_va) {
+                pr_err("UDMA NV P2P: address overflow: va=0x%llx len=0x%llx\n",
+                       (unsigned long long)gpu_va,
+                       (unsigned long long)length);
+                return -EINVAL;
+        }
+
+        if (!IS_ALIGNED(gpu_va, UDMA_NV_GPU_PAGE_SIZE)) {
+                pr_err("UDMA NV P2P: gpu_va is not 64KB aligned: "
+                       "va=0x%llx offset=0x%llx\n",
+                       (unsigned long long)gpu_va,
+                       (unsigned long long)
+                       (gpu_va & (UDMA_NV_GPU_PAGE_SIZE - 1)));
+                return -EINVAL;
+        }
+
+        if (!IS_ALIGNED(length, UDMA_NV_GPU_PAGE_SIZE)) {
+                pr_err("UDMA NV P2P: length is not 64KB aligned: "
+                       "len=0x%llx offset=0x%llx\n",
+                       (unsigned long long)length,
+                       (unsigned long long)
+                       (length & (UDMA_NV_GPU_PAGE_SIZE - 1)));
+                return -EINVAL;
+        }
+
+        /*
+         * 新驱动的普通 get_pages 不允许 NULL callback；
+         * nv-p2p.h 也要求 data 为 non-NULL。
+         */
+        if (!free_callback) {
+                pr_err("UDMA NV P2P: free_callback is NULL\n");
+                return -EINVAL;
+        }
+
+        if (!data) {
+                pr_err("UDMA NV P2P: callback data is NULL\n");
+                return -EINVAL;
+        }
+
+        if (!current->mm) {
+                pr_warn("UDMA NV P2P: current->mm is NULL; "
+                        "get_pages may be running from a kernel thread/workqueue\n");
+        }
+
+        if (in_interrupt() || in_atomic()) {
+                pr_warn("UDMA NV P2P: called from non-sleepable context; "
+                        "nvidia_p2p_get_pages may sleep\n");
+        }
+
+        if (*page_table) {
+                pr_warn("UDMA NV P2P: *page_table is already non-NULL: %px\n",
+                        *page_table);
+        }
+
+        pr_info("UDMA NV P2P: calling NVIDIA API range=[0x%llx, 0x%llx)\n",
+                (unsigned long long)gpu_va,
+                (unsigned long long)end);
+
+        ret = nvidia_p2p_get_pages(0, 0, gpu_va, length, page_table,
+                                   free_callback, data);
+
+        if (ret) {
+                pr_err("UDMA NV P2P: nvidia_p2p_get_pages failed: "
+                       "va=0x%llx len=0x%llx ret=%d%s\n",
+                       (unsigned long long)gpu_va,
+                       (unsigned long long)length,
+                       ret,
+                       ret == -EINVAL ? " (EINVAL)" :
+                       ret == -ENOMEM ? " (ENOMEM)" :
+                       ret == -EIO ? " (EIO)" : "");
+                return ret;
+        }
+
+        pt = *page_table;
+        if (!pt) {
+                pr_err("UDMA NV P2P: API returned success but page_table is NULL\n");
+                return -EIO;
+        }
+
+        pr_info("UDMA NV P2P get_pages success: "
+                "pt=%px version=0x%08x page_size_id=%u "
+                "entries=%u pages=%px gpu_uuid=%px\n",
+                pt,
+                pt->version,
+                pt->page_size,
+                pt->entries,
+                pt->pages,
+                pt->gpu_uuid);
+
+        if (!NVIDIA_P2P_PAGE_TABLE_VERSION_COMPATIBLE(pt))
+                pr_warn("UDMA NV P2P: incompatible page-table version 0x%08x\n",
+                        pt->version);
+
+        if (pt->entries && pt->pages) {
+                struct nvidia_p2p_page *first = pt->pages[0];
+                struct nvidia_p2p_page *last = pt->pages[pt->entries - 1];
+
+                pr_info("UDMA NV P2P: first_page=%px pa=0x%llx "
+                        "last_page=%px pa=0x%llx\n",
+                        first,
+                        first ?
+                        (unsigned long long)first->physical_address : 0ULL,
+                        last,
+                        last ?
+                        (unsigned long long)last->physical_address : 0ULL);
+        }
+
+        return 0;
 }
 
 static int udma_nv_p2p_bridge_put_pages(uint64_t gpu_va,

@@ -337,6 +337,12 @@ struct udma_tp_ctx {
 
 int udma_ioummu_map(uint32_t l_tid, uint32_t r_tid, int prot, uint64_t addr,
 		    struct sg_table *sgt);
+//TONG @ HKSAR
+//ADD for GDR
+int udma_ioummu_map_phys_sg(uint32_t l_tid, uint32_t r_tid,
+			    int prot, uint64_t addr,
+			    struct sg_table *sgt);
+
 void udma_ioummu_unmap(uint32_t l_tid, uint32_t r_tid, uint64_t addr, size_t size);
 struct udma_umem *udma_umem_get(struct udma_umem_param *param);
 void udma_umem_release(struct udma_umem *umem, bool is_kernel, bool dirty);

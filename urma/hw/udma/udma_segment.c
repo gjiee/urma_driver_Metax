@@ -372,11 +372,30 @@ static void udma_unpin_seg_pages(struct udma_segment *seg, bool dirty)
 		udma_put_user_page(seg);
 }
 
+/*
+ * TONG @ HKSAR
+ * Replace for GDR
 static int udma_ioummu_remote_map(uint32_t tid, struct udma_segment *seg, int prot)
 {
 	return udma_ioummu_map(UMMU_INVALID_TID, tid, prot,
 			       seg->addr, &(seg->umem->append.sgt));
 }
+*/
+
+static int udma_ioummu_remote_map(uint32_t tid,
+				  struct udma_segment *seg,
+				  int prot)
+{
+	if (udma_seg_is_gpu(seg))
+		return udma_ioummu_map_phys_sg(
+			UMMU_INVALID_TID, tid, prot,
+			seg->addr, &seg->umem->append.sgt);
+
+	return udma_ioummu_map(
+		UMMU_INVALID_TID, tid, prot,
+		seg->addr, &seg->umem->append.sgt);
+}
+
 
 static int udma_iommu_partial_overlap_seg(struct ubcore_device *ub_dev,
 					  struct udma_context *ctx,
@@ -463,7 +482,10 @@ static int udma_iommu_local_map(struct ubcore_device *ub_dev,
 		mutex_unlock(&ctx->seg_tree->lock);
 		return 0;
 	}
-
+	/*
+	 * TONG @ HKSAR
+	 * Replace for GDR
+	 * ADD extra statement for handling GPU path
 	if (pageList.head->length == PAGE_ALIGN(seg->length)) {
 		ret = udma_ioummu_map(ctx->tid, UMMU_INVALID_TID, prot,
 				      seg->addr, &(seg->umem->append.sgt));
@@ -476,6 +498,40 @@ static int udma_iommu_local_map(struct ubcore_device *ub_dev,
 			dev_err(ctx->dev->dev,
 				"IOMMU partial overlap segment failed, ret = %d.\n", ret);
 	}
+	*/
+	
+	if (pageList.head->length == PAGE_ALIGN(seg->length)) {
+		if (udma_seg_is_gpu(seg))
+			ret = udma_ioummu_map_phys_sg(
+				ctx->tid, UMMU_INVALID_TID, prot,
+				seg->addr, &seg->umem->append.sgt);
+		else
+			ret = udma_ioummu_map(
+				ctx->tid, UMMU_INVALID_TID, prot,
+				seg->addr, &seg->umem->append.sgt);
+
+		if (unlikely(ret))
+			dev_err(ctx->dev->dev,
+				"IOMMU segment failed, gpu=%d ret=%d\n",
+				udma_seg_is_gpu(seg), ret);
+	} else if (udma_seg_is_gpu(seg)) {
+	/*
+	 * IF IS GPU, NO NEED IOMMU_PARTIALK_OVERLAP_SEG
+	 */
+		ret = -EOPNOTSUPP;
+		dev_err(ctx->dev->dev,
+			"GPU segment partial-overlap mapping is not supported\n");
+	} else {
+		ret = udma_iommu_partial_overlap_seg(
+			ub_dev, ctx, seg, cfg, &pageList);
+
+		if (unlikely(ret))
+			dev_err(ctx->dev->dev,
+				"IOMMU partial overlap segment failed, ret=%d\n",
+				ret);
+	}
+
+
 	udma_range_list_destroy(&pageList);
 	if (ret) {
 		udma_seg_range_release(ctx, seg, &pageList);
@@ -633,6 +689,7 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 	udma_tid = to_udma_tid(seg->core_tseg.token_id);
 
 	if (udata && udma_dev->caps.sva_sep_mode_en) {
+        dev_info(udma_dev->dev,"MATT START:kernel_mode=%d\n", seg->kernel_mode);
 		ret = udma_pin_pages_and_ioummu_map(ub_dev, to_udma_context(udata->uctx), seg,
 						    cfg, udma_tid->tid);
 		if (ret) {
@@ -650,6 +707,7 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 		 * HOST: udma_pin_segment
 		 */
 		if (udma_seg_cfg_is_gpu(cfg)) {
+			printk("GPU pin pages\n");
 			ret = udma_gpu_pin_seg_pages(udma_dev, seg, cfg);
 			if (!ret)
 				seg->tid = udma_tid->tid;
@@ -663,8 +721,11 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 		}
 	}
 
-	if (udata)
-		return &seg->core_tseg;
+	if (udata){
+        dev_info(udma_dev->dev,"MATT END:kernel_mode=%d\n", seg->kernel_mode);
+        return &seg->core_tseg;
+    }
+		
 
 	mutex_lock(&udma_dev->ksva_mutex);
 	ksva = (struct iommu_sva *)xa_load(&udma_dev->ksva_table, udma_tid->tid);
@@ -673,7 +734,7 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 			"unable to get ksva while register segment, token maybe is free.\n");
 		goto err_load_ksva;
 	}
-
+    
 	ret = udma_sva_grant(cfg, ksva);
 	if (ret) {
 		dev_err(udma_dev->dev,
@@ -685,7 +746,8 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 
 	if (dfx_switch)
 		udma_dfx_store_seg(udma_dev, cfg);
-
+    dev_info(udma_dev->dev,
+			"MAPT END:kernel_mode = %d\n",seg->kernel_mode);
 	return &seg->core_tseg;
 
 err_load_ksva:

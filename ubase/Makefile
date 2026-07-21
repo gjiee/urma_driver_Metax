@@ -4,8 +4,8 @@
 #
 ##
 
-ccflags-y += -I$(srctree)/$(src)
-ccflags-y += -I$(srctree)/drivers/ub/ubase/debugfs
+ccflags-y += -I$(src)
+ccflags-y += -I$(src)/debugfs
 
 MODULE_NAME := ubase
 

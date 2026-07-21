@@ -321,7 +321,7 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 			     udma_gpu_p2p_free_callback, seg);
 	if (ret) {
 		dev_err(dev->dev,
-			"GPU P2P get_pages failed gpu_va=0x%llx len=0x%llx ret=%d\n",
+			"WTF? GPU P2P get_pages failed gpu_va=0x%llx len=0x%llx ret=%d\n",
 			gpu_va, mapped_size, ret);
 		udma_gpu_p2p_ops_put(ops);
 		return ret;
@@ -369,7 +369,7 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 	 * 不受后面 UMMU 建表是否成功影响。验证完改回 0（或删掉这块 #if）
 	 * 即可恢复正常注册流程。
 	 */
-#define UDMA_GPU_P2P_TEST_STOP_AFTER_SG 0
+#define UDMA_GPU_P2P_TEST_STOP_AFTER_SG 1  
 #if UDMA_GPU_P2P_TEST_STOP_AFTER_SG
 	dev_err(dev->dev,
 		"[GPU-TRACE] TEST STOP: UDMA_GPU_P2P_TEST_STOP_AFTER_SG=1, "

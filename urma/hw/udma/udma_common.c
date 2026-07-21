@@ -247,6 +247,22 @@ int udma_ioummu_map(uint32_t l_tid, uint32_t r_tid, int prot, uint64_t addr,
 
 	return ummu_sva_matt_map(&domain, addr, sgt, prot);
 }
+// TONG @ HKSAR
+// ADD for GDR
+
+int udma_ioummu_map_phys_sg(uint32_t l_tid, uint32_t r_tid,
+			    int prot, uint64_t addr,
+			    struct sg_table *sgt)
+{
+	struct ummu_matt_domain domain = {};
+
+	domain.l_tid = l_tid;
+	domain.r_tid = r_tid;
+	domain.mm = current->mm;
+
+	return ummu_sva_matt_map_phys_sg(&domain, addr, sgt, prot);
+}
+
 
 void udma_ioummu_unmap(uint32_t l_tid, uint32_t r_tid, uint64_t addr, size_t size)
 {
