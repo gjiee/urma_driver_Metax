@@ -179,6 +179,8 @@ struct ubcore_target_seg *ubcore_register_seg(struct ubcore_device *dev,
 	struct ubcore_seg_cfg tmp_cfg;
 	struct ubcore_target_seg *tseg;
 	uint32_t perf_register_seg_type;
+    ubcore_log_warn("start ubcore_register_seg,cfg->iova = 0x%llx, cfg->len = %d, cfg->token_value.token = %d, udate = %d ",
+		 (unsigned long long)cfg->iova, cfg->len, cfg->token_value.token, udata == NULL);
 
 	UBCORE_PERF_TRACE_BEGIN(PERF_CORE_REGISTER_SEG);
 

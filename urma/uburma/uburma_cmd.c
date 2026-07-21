@@ -264,7 +264,6 @@ static int uburma_cmd_register_seg(struct ubcore_device *ubc_dev,
 		ret = -ENOMEM;
 		goto err_put_token_id;
 	}
-
 	seg = ubcore_register_seg(ubc_dev, &cfg, &udata);
 	if (IS_ERR_OR_NULL(seg)) {
 		ret = PTR_ERR(seg);
