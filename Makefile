@@ -3,7 +3,7 @@ ifeq ($(KERNELRELEASE),)
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 # Closed-source NVIDIA driver source
-NVIDIA_SRC ?= /usr/src/nvidia-580.173.02
+NVIDIA_SRC ?= /usr/src/nvidia-575.57.08
 NV_P2P_HEADER_PATH ?= $(NVIDIA_SRC)/nvidia
 
 # 优先用 DKMS 当前内核生成的 Module.symvers；没有再 fallback 到 /usr/src
