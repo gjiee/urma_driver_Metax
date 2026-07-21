@@ -247,21 +247,6 @@ int udma_ioummu_map(uint32_t l_tid, uint32_t r_tid, int prot, uint64_t addr,
 
 	return ummu_sva_matt_map(&domain, addr, sgt, prot);
 }
-// TONG @ HKSAR
-// ADD for GDR
-
-int udma_ioummu_map_phys_sg(uint32_t l_tid, uint32_t r_tid,
-			    int prot, uint64_t addr,
-			    struct sg_table *sgt)
-{
-	struct ummu_matt_domain domain = {};
-
-	domain.l_tid = l_tid;
-	domain.r_tid = r_tid;
-	domain.mm = current->mm;
-
-	return ummu_sva_matt_map_phys_sg(&domain, addr, sgt, prot);
-}
 
 
 void udma_ioummu_unmap(uint32_t l_tid, uint32_t r_tid, uint64_t addr, size_t size)
@@ -274,6 +259,44 @@ void udma_ioummu_unmap(uint32_t l_tid, uint32_t r_tid, uint64_t addr, size_t siz
 
 	ummu_sva_matt_unmap(&domain, addr, size);
 }
+
+#ifdef CONFIG_UMMU_MATT_PHYS_SG
+// TONG @ HKSAR
+// ADD for GDR
+int udma_ioummu_map_phys_sg(uint32_t l_tid, uint32_t r_tid,
+			    int prot, uint64_t addr,
+			    struct sg_table *sgt)
+{
+	struct ummu_matt_domain domain = {};
+
+	domain.l_tid = l_tid;
+	domain.r_tid = r_tid;
+	domain.mm = current->mm;
+
+	pr_info("UDMA GPU map: iova=0x%llx first_pa=0x%llx nents=%u\n",
+		addr,
+		(uint64_t)sg_dma_address(sgt->sgl),
+		sgt->nents);
+
+	return ummu_sva_matt_map_phys_sg(&domain, addr, sgt, prot);
+}
+
+int udma_ioummu_unmap_phys_sg(uint32_t l_tid, uint32_t r_tid,
+			      uint64_t addr, size_t size)
+{
+	struct ummu_matt_domain domain = {};
+
+	domain.l_tid = l_tid;
+	domain.r_tid = r_tid;
+	domain.mm = current->mm;
+
+	pr_info("UDMA GPU unmap: iova=0x%llx size=0x%zx\n",
+		addr, size);
+
+	return ummu_sva_matt_unmap_phys_sg(&domain, addr, size);
+}
+
+#endif
 
 int udma_id_alloc_auto_grow(struct udma_dev *udma_dev, struct udma_ida *ida_table,
 			    uint32_t *idx)

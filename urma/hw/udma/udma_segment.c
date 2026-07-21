@@ -386,16 +386,21 @@ static int udma_ioummu_remote_map(uint32_t tid,
 				  struct udma_segment *seg,
 				  int prot)
 {
-	if (udma_seg_is_gpu(seg))
+	if (udma_seg_is_gpu(seg)) {
+		int ret;
+#ifdef CONFIG_UMMU_MATT_PHYS_SG
 		return udma_ioummu_map_phys_sg(
 			UMMU_INVALID_TID, tid, prot,
 			seg->addr, &seg->umem->append.sgt);
+#else
+		return -EOPNOTSUPP;
+#endif
+	}
 
 	return udma_ioummu_map(
 		UMMU_INVALID_TID, tid, prot,
 		seg->addr, &seg->umem->append.sgt);
 }
-
 
 static int udma_iommu_partial_overlap_seg(struct ubcore_device *ub_dev,
 					  struct udma_context *ctx,
@@ -502,13 +507,23 @@ static int udma_iommu_local_map(struct ubcore_device *ub_dev,
 	
 	if (pageList.head->length == PAGE_ALIGN(seg->length)) {
 		if (udma_seg_is_gpu(seg))
+		{
+#ifdef CONFIG_UMMU_MATT_PHYS_SG
 			ret = udma_ioummu_map_phys_sg(
-				ctx->tid, UMMU_INVALID_TID, prot,
+				UMMU_INVALID_TID, tid, prot,
 				seg->addr, &seg->umem->append.sgt);
+#else
+			dev_err(ctx->dev->dev,
+				"GPU MATT physical SG mapping is not enabled\n");
+				ret = -EOPNOTSUPP;
+#endif
+		}
 		else
+		{
 			ret = udma_ioummu_map(
 				ctx->tid, UMMU_INVALID_TID, prot,
 				seg->addr, &seg->umem->append.sgt);
+		}
 
 		if (unlikely(ret))
 			dev_err(ctx->dev->dev,
@@ -540,6 +555,23 @@ static int udma_iommu_local_map(struct ubcore_device *ub_dev,
 	mutex_unlock(&ctx->seg_tree->lock);
 
 	return ret;
+}
+
+static void udma_seg_ioummu_unmap( uint32_t l_tid, uint32_t r_tid, struct udma_segment *seg, uint64_t addr, size_t size)
+{
+	if (udma_seg_is_gpu(seg)) { 
+#ifdef CONFIG_UMMU_MATT_PHYS_SG 
+		int ret; 
+		ret = udma_ioummu_unmap_phys_sg( l_tid, r_tid, addr, size); 
+		if (ret) 
+			pr_err("UDMA GPU unmap failed ret=%d\n", ret); 
+#else 
+		pr_err("UDMA GPU unmap unavailable\n"); 
+#endif 
+		return; 
+	} 
+	udma_ioummu_unmap( l_tid, r_tid, addr, size); 
+
 }
 
 static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct udma_context *ctx,
@@ -629,6 +661,9 @@ err_ioummu_remote_map:
 
 	return ret;
 }
+
+
+
 
 static void udma_unpin_pages_and_unioummu_map(struct udma_context *ctx, struct udma_segment *seg,
 					      uint32_t tid)
