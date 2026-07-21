@@ -342,10 +342,12 @@ int udma_ioummu_map(uint32_t l_tid, uint32_t r_tid, int prot, uint64_t addr,
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
 int udma_ioummu_map_phys_sg(uint32_t l_tid, uint32_t r_tid,
 			    int prot, uint64_t addr,
-			    struct sg_table *sgt);
+			    struct sg_table *sgt,
+			    struct mm_struct *mm);
 
 int udma_ioummu_unmap_phys_sg(uint32_t l_tid, uint32_t r_tid,
-			      uint64_t addr, size_t size);
+			      uint64_t addr, size_t size,
+			      struct mm_struct *mm);
 #endif
 
 void udma_ioummu_unmap(uint32_t l_tid, uint32_t r_tid, uint64_t addr, size_t size);

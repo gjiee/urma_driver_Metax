@@ -383,14 +383,16 @@ static int udma_ioummu_remote_map(uint32_t tid, struct udma_segment *seg, int pr
 */
 
 static int udma_ioummu_remote_map(uint32_t tid,
+				  struct udma_context *ctx,
 				  struct udma_segment *seg,
 				  int prot)
 {
 	if (udma_seg_is_gpu(seg)) {
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
 		return udma_ioummu_map_phys_sg(
-			UMMU_INVALID_TID, tid, prot,
-			seg->addr, &seg->umem->append.sgt);
+			ctx->tid, UMMU_INVALID_TID, tid, prot,
+			seg->addr, &seg->umem->append.sgt,
+			ctx->mm);
 #else
 		return -EOPNOTSUPP;
 #endif
@@ -556,21 +558,28 @@ static int udma_iommu_local_map(struct ubcore_device *ub_dev,
 	return ret;
 }
 
-static void udma_seg_ioummu_unmap( uint32_t l_tid, uint32_t r_tid, struct udma_segment *seg, uint64_t addr, size_t size)
+static void udma_seg_ioummu_unmap(
+	struct udma_context *ctx,
+	uint32_t l_tid,
+	uint32_t r_tid,
+	struct udma_segment *seg,
+	uint64_t addr,
+	size_t size)
 {
-	if (udma_seg_is_gpu(seg)) { 
-#ifdef CONFIG_UMMU_MATT_PHYS_SG 
-		int ret; 
-		ret = udma_ioummu_unmap_phys_sg( l_tid, r_tid, addr, size); 
-		if (ret) 
-			pr_err("UDMA GPU unmap failed ret=%d\n", ret); 
-#else 
-		pr_err("UDMA GPU unmap unavailable\n"); 
-#endif 
-		return; 
-	} 
-	udma_ioummu_unmap( l_tid, r_tid, addr, size); 
+	if (udma_seg_is_gpu(seg)) {
+#ifdef CONFIG_UMMU_MATT_PHYS_SG
+		int ret;
 
+		ret = udma_ioummu_unmap_phys_sg(
+			l_tid, r_tid, addr, size,
+			ctx->mm);
+		if (ret)
+			pr_err("UDMA GPU unmap failed ret=%d\n", ret);
+#endif
+		return;
+	}
+
+	udma_ioummu_unmap(l_tid, r_tid, addr, size);
 }
 
 static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct udma_context *ctx,
@@ -603,7 +612,7 @@ static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct ud
 		seg->tid = tid;
 
 		if (!local_only) {
-			ret = udma_ioummu_remote_map(tid, seg, prot);
+			ret = udma_ioummu_remote_map(tid, ctx, seg, prot);
 			if (unlikely(ret)) {
 				dev_err(ctx->dev->dev,
 					"GPU seg ioummu remote map failed, ret=%d\n", ret);
@@ -622,7 +631,7 @@ static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct ud
 
 err_gpu_remote_unmap:
 		if (!local_only)
-			udma_seg_ioummu_unmap(UMMU_INVALID_TID, tid, seg,
+			udma_seg_ioummu_unmap(ctx, UMMU_INVALID_TID, tid, seg,
 				seg->addr, seg->length);
 err_gpu_pin:
 		udma_gpu_unpin_seg_pages(seg);
@@ -635,7 +644,7 @@ err_gpu_pin:
 		return ret;
 
 	if (!local_only) {
-		ret = udma_ioummu_remote_map(tid, seg, prot);
+		ret = udma_ioummu_remote_map(tid, ctx, seg, prot);
 		if (unlikely(ret)) {
 			dev_err(ctx->dev->dev, "IOMMU remote map failed, ret = %d.\n", ret);
 			goto err_ioummu_remote_map;
@@ -650,11 +659,11 @@ err_gpu_pin:
 	}
 
 	return ret;
-
 err_ioummu_local_map:
 	if (!local_only)
-		udma_seg_ioummu_unmap(UMMU_INVALID_TID, tid, seg,
-				seg->addr, seg->length);
+		udma_seg_ioummu_unmap(
+			UMMU_INVALID_TID, tid, seg,
+			seg->addr, PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 		//udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
 		//		  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 err_ioummu_remote_map:
@@ -695,7 +704,7 @@ static void udma_unpin_pages_and_unioummu_map(struct udma_context *ctx, struct u
 				current_node->length);
 
 		udma_seg_ioummu_unmap(
-			ctx->tid, UMMU_INVALID_TID, seg,
+			ctx, ctx->tid, UMMU_INVALID_TID, seg,
 			current_node->start, unmap_size);
 
 		current_node = current_node->next;
