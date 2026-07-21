@@ -390,9 +390,9 @@ static int udma_ioummu_remote_map(uint32_t tid,
 	if (udma_seg_is_gpu(seg)) {
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
 		return udma_ioummu_map_phys_sg(
-			ctx->tid, UMMU_INVALID_TID, tid, prot,
-			seg->addr, &seg->umem->append.sgt,
-			ctx->mm);
+			ctx->tid, UMMU_INVALID_TID, prot,
+				seg->addr, &seg->umem->append.sgt,
+				ctx->mm);
 #else
 		return -EOPNOTSUPP;
 #endif
@@ -512,7 +512,8 @@ static int udma_iommu_local_map(struct ubcore_device *ub_dev,
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
 			ret = udma_ioummu_map_phys_sg(
 				ctx->tid, UMMU_INVALID_TID, prot,
-				seg->addr, &seg->umem->append.sgt);
+				seg->addr, &seg->umem->append.sgt,
+				ctx->mm);
 #else
 			dev_err(ctx->dev->dev,
 				"GPU MATT physical SG mapping is not enabled\n");
@@ -662,7 +663,7 @@ err_gpu_pin:
 err_ioummu_local_map:
 	if (!local_only)
 		udma_seg_ioummu_unmap(
-			UMMU_INVALID_TID, tid, seg,
+			ctx, UMMU_INVALID_TID, tid, seg,
 			seg->addr, PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 		//udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
 		//		  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
