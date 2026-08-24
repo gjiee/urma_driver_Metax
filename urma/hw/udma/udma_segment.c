@@ -390,9 +390,9 @@ static int udma_ioummu_remote_map(uint32_t tid,
 	if (udma_seg_is_gpu(seg)) {
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
 		return udma_ioummu_map_phys_sg(
-			ctx->tid, UMMU_INVALID_TID, prot,
-				seg->addr, &seg->umem->append.sgt,
-				ctx->mm);
+			UMMU_INVALID_TID, tid, prot,
+			seg->addr, &seg->umem->append.sgt,
+			ctx->mm);
 #else
 		return -EOPNOTSUPP;
 #endif
@@ -685,8 +685,11 @@ static void udma_unpin_pages_and_unioummu_map(struct udma_context *ctx, struct u
 	struct udma_range_list pageList = {};
 
 	if (!local_only)
-		udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
-				  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
+		udma_seg_ioummu_unmap(
+			ctx, UMMU_INVALID_TID, tid, seg, seg->addr,
+			PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
+		//udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
+		//		  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 
 	mutex_lock(&ctx->seg_tree->lock);
 	udma_seg_range_release(ctx, seg, &pageList);
