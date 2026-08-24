@@ -25,12 +25,15 @@ struct nvidia_p2p_page_table;
  *              重复调用未定义），只做本地清理。
  *              这是 TODO：正确做法应该在此时通知 ubcore/上层使该段失效，
  *              当前测试补丁只打印错误日志，不做进一步传播。
+ * matt_mapped: isolated SVA (sva_sep_mode_en == 0) 下已为该 GPU VA 安装
+ *              MATT physical-SG overlay。unregister 时必须先 unmap 再 unpin。
  */
 struct udma_gpu_p2p_mem {
 	struct nvidia_p2p_page_table *page_table;
 	uint64_t gpu_va;
 	uint64_t mapped_size;
 	bool force_freed;
+	bool matt_mapped;
 };
 
 struct udma_segment {

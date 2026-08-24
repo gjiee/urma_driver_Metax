@@ -56,6 +56,15 @@ static int udma_pin_segment(struct ubcore_device *ub_dev, struct ubcore_seg_cfg 
 
 static void udma_unpin_seg(struct udma_segment *seg, bool dirty)
 {
+	/*
+	 * GPU SG entries use sg_page=NULL and stash the BAR PA in
+	 * sg_dma_address. Host umem_release would call
+	 * unpin_user_page_range_dirty_lock(NULL) and panic (NULL+8).
+	 */
+	if (udma_seg_is_gpu(seg)) {
+		udma_gpu_unpin_seg_pages(seg);
+		return;
+	}
 	if (!seg->core_tseg.seg.attr.bs.non_pin)
 		udma_umem_release(seg->umem, seg->kernel_mode, dirty);
 }
@@ -666,7 +675,7 @@ err_ioummu_local_map:
 			ctx, UMMU_INVALID_TID, tid, seg,
 			seg->addr, PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 		//udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
-		//		  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
+			//	  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 err_ioummu_remote_map:
 	udma_unpin_seg_pages(seg, dirty);
 
@@ -689,7 +698,7 @@ static void udma_unpin_pages_and_unioummu_map(struct udma_context *ctx, struct u
 			ctx, UMMU_INVALID_TID, tid, seg, seg->addr,
 			PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 		//udma_ioummu_unmap(UMMU_INVALID_TID, tid, seg->addr,
-		//		  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
+			//	  PAGE_SIZE * udma_cal_npages(seg->addr, seg->length));
 
 	mutex_lock(&ctx->seg_tree->lock);
 	udma_seg_range_release(ctx, seg, &pageList);
@@ -717,6 +726,81 @@ static void udma_unpin_pages_and_unioummu_map(struct udma_context *ctx, struct u
 	mutex_unlock(&ctx->seg_tree->lock);
 
 	udma_unpin_seg_pages(seg, true);
+}
+
+static size_t udma_seg_unmap_size(const struct udma_segment *seg)
+{
+	return PAGE_SIZE * udma_cal_npages(seg->addr, seg->length);
+}
+
+/*
+ * Isolated SVA (sva_sep_mode_en == 0) binds the process mm and walks
+ * CPU page tables. CUDA GPU VAs are not backed by the nvidia_p2p BAR
+ * PAs in those tables, so a successful get_pages still UMMU-faults
+ * (event 0x0a at an address inside the GPU VA). Install a MATT
+ * physical-SG overlay at the GPU VA.
+ *
+ * Do not call udma_iommu_local_map() here: that path uses
+ * ctx->seg_tree, which is only allocated when sva_sep_mode_en == 1.
+ */
+static int udma_gpu_matt_map_isolated(struct udma_context *ctx,
+				      struct udma_segment *seg)
+{
+#ifdef CONFIG_UMMU_MATT_PHYS_SG
+	uint32_t access = seg->core_tseg.seg.attr.bs.access;
+	bool local_only = access & UBCORE_ACCESS_LOCAL_ONLY;
+	int prot = IOMMU_WRITE | IOMMU_READ;
+	int ret;
+
+	if (!ctx || !ctx->mm || !seg->umem)
+		return -EINVAL;
+
+	if (!local_only) {
+		ret = udma_ioummu_remote_map(seg->tid, ctx, seg, prot);
+		if (ret)
+			return ret;
+	}
+
+	ret = udma_ioummu_map_phys_sg(ctx->tid, UMMU_INVALID_TID, prot,
+				      seg->addr, &seg->umem->append.sgt,
+				      ctx->mm);
+	if (ret) {
+		if (!local_only)
+			udma_seg_ioummu_unmap(ctx, UMMU_INVALID_TID, seg->tid,
+					      seg, seg->addr,
+					      udma_seg_unmap_size(seg));
+		return ret;
+	}
+
+	seg->gpu.matt_mapped = true;
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+static void udma_gpu_matt_unmap_isolated(struct udma_context *ctx,
+					 struct udma_segment *seg)
+{
+	uint32_t access;
+	bool local_only;
+	size_t size;
+
+	if (!seg->gpu.matt_mapped)
+		return;
+
+	access = seg->core_tseg.seg.attr.bs.access;
+	local_only = access & UBCORE_ACCESS_LOCAL_ONLY;
+	size = udma_seg_unmap_size(seg);
+
+	if (ctx) {
+		udma_seg_ioummu_unmap(ctx, ctx->tid, UMMU_INVALID_TID, seg,
+				      seg->addr, size);
+		if (!local_only)
+			udma_seg_ioummu_unmap(ctx, UMMU_INVALID_TID, seg->tid,
+					      seg, seg->addr, size);
+	}
+	seg->gpu.matt_mapped = false;
 }
 
 struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
@@ -763,16 +847,30 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 
 	if (!cfg->flag.bs.non_pin) {
 		/*
-		 * GPU兼容测试补丁 — legacy 路径（sva_sep_mode_en == 0）
-		 * 仅 pin，不走 udma_pin_pages_and_ioummu_map
-		 * GPU: udma_gpu_pin_seg_pages + seg->tid
-		 * HOST: udma_pin_segment
+		 * Isolated SVA (sva_sep_mode_en == 0): no ctx->seg_tree.
+		 * HOST: pin only; UMMU walks the process page tables.
+		 * GPU:  pin BAR PAs, then install a MATT phys-SG overlay.
+		 *       Do not call udma_pin_pages_and_ioummu_map() here.
 		 */
 		if (udma_seg_cfg_is_gpu(cfg)) {
 			printk("GPU pin pages\n");
 			ret = udma_gpu_pin_seg_pages(udma_dev, seg, cfg);
 			if (!ret)
 				seg->tid = udma_tid->tid;
+			if (!ret && udata) {
+				ret = udma_gpu_matt_map_isolated(
+					to_udma_context(udata->uctx), seg);
+				if (ret) {
+					dev_err(udma_dev->dev,
+						"GPU isolated MATT map failed va=0x%llx len=0x%llx ret=%d\n",
+						seg->addr, seg->length, ret);
+					udma_gpu_unpin_seg_pages(seg);
+				} else {
+					dev_info(udma_dev->dev,
+						 "GPU isolated MATT map OK va=0x%llx len=0x%llx tid=%u\n",
+						 seg->addr, seg->length, seg->tid);
+				}
+			}
 		} else {
 			ret = udma_pin_segment(ub_dev, cfg, seg,
 					       !!(cfg->flag.bs.access & UBCORE_ACCESS_WRITE));
@@ -783,10 +881,13 @@ struct ubcore_target_seg *udma_register_seg(struct ubcore_device *ub_dev,
 		}
 	}
 
-	if (udata){
-        dev_info(udma_dev->dev,"MATT END:kernel_mode=%d\n", seg->kernel_mode);
-        return &seg->core_tseg;
-    }
+	if (udata) {
+		dev_info(udma_dev->dev,
+			 "MATT END:kernel_mode=%d gpu=%d sva_sep=%d matt_mapped=%d\n",
+			 seg->kernel_mode, udma_seg_is_gpu(seg),
+			 udma_dev->caps.sva_sep_mode_en, seg->gpu.matt_mapped);
+		return &seg->core_tseg;
+	}
 		
 
 	mutex_lock(&udma_dev->ksva_mutex);
@@ -864,11 +965,15 @@ int udma_unregister_seg(struct ubcore_target_seg *ubcore_seg)
 				    ubcore_seg->seg.ubva.va);
 
 common_process:
-	if (!seg->kernel_mode && udma_dev->caps.sva_sep_mode_en)
+	if (!seg->kernel_mode && udma_dev->caps.sva_sep_mode_en) {
 		udma_unpin_pages_and_unioummu_map(to_udma_context(ubcore_seg->uctx),
 						  seg, udma_tid->tid);
-	else
+	} else {
+		if (udma_seg_is_gpu(seg) && ubcore_seg->uctx)
+			udma_gpu_matt_unmap_isolated(
+				to_udma_context(ubcore_seg->uctx), seg);
 		udma_unpin_seg(seg, true);
+	}
 	seg->token_value = 0;
 	kfree(seg);
 
