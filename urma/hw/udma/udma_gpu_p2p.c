@@ -47,8 +47,6 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
-#include <linux/mm.h>
-#include <linux/limits.h>
 #include <linux/scatterlist.h>
 
 #include "udma_gpu_p2p.h"
@@ -178,58 +176,34 @@ static uint64_t udma_gpu_align_len(uint64_t addr, uint64_t len)
 }
 
 /*
- * Build an SG table from NVIDIA P2P pages.
+ * GPU兼容测试补丁: 本地拼 sg_table，替代不存在的 nvidia_p2p_build_sg_table_phys
+ * @page_table: provider get_pages() 返回值，entries/pages[]/page_size 都是
+ *              官方 nv-p2p.h 公开字段。
+ * @sgt:        输出，sg_page=NULL（无 struct page，纯 PA），
+ *              sg_dma_address=GPU 物理地址，sg_dma_len=64KB（与 NV P2P 页一致）。
  *
- * NVIDIA pages are 64KB. This UMMU advertises pgsize_bitmap 4K/2M/1G
- * (0x40201000) and has no 64KB leaf. Installing one 64KB PHYS-SG
- * entry per NV page only software-verified the start IOVA; hardware
- * then storm-faulted (ummu event 0x0a, hundreds of callbacks
- * suppressed) at mid-range addresses such as 0x30421a000.
- *
- * Split each 64KB NV page into PAGE_SIZE (4KB) SG entries so
- * ummu_sva_matt_map_phys_sg installs 4K leaves the UMMU can walk.
- * sg_page remains NULL; the BAR PA stays in sg_dma_address.
+ * 不再把 64KB NV 页切成 4KB SG。V100 不共页表路径上 iommu_map 会按
+ * pgsize_bitmap 自己拆叶；小消息卡住是 GDR last-byte 可见性，不是 SG 粒度。
  */
 static int udma_gpu_build_sg_table(struct nvidia_p2p_page_table *page_table,
 				   struct sg_table *sgt)
 {
 	struct scatterlist *sg;
-	uint32_t pages_per_nv;
-	uint32_t nents;
-	uint32_t i, j;
+	uint64_t page_size = UDMA_GPU_P2P_PAGE_SIZE;
+	uint32_t i;
 	int ret;
 
 	if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB)
 		return -EINVAL;
 
-	if (UDMA_GPU_P2P_PAGE_SIZE < PAGE_SIZE ||
-	    (UDMA_GPU_P2P_PAGE_SIZE % PAGE_SIZE) != 0)
-		return -EINVAL;
-
-	pages_per_nv = UDMA_GPU_P2P_PAGE_SIZE / PAGE_SIZE;
-	if (page_table->entries > UINT_MAX / pages_per_nv)
-		return -EINVAL;
-
-	nents = page_table->entries * pages_per_nv;
-
-	ret = sg_alloc_table(sgt, nents, GFP_KERNEL);
+	ret = sg_alloc_table(sgt, page_table->entries, GFP_KERNEL);
 	if (ret)
 		return ret;
 
-	sg = sgt->sgl;
-	for (i = 0; i < page_table->entries; i++) {
-		uint64_t pa = page_table->pages[i]->physical_address;
-
-		for (j = 0; j < pages_per_nv; j++) {
-			if (!sg) {
-				sg_free_table(sgt);
-				return -EINVAL;
-			}
-			sg_set_page(sg, NULL, PAGE_SIZE, 0);
-			sg_dma_address(sg) = pa + (uint64_t)j * PAGE_SIZE;
-			sg_dma_len(sg) = PAGE_SIZE;
-			sg = sg_next(sg);
-		}
+	for_each_sg(sgt->sgl, sg, page_table->entries, i) {
+		sg_set_page(sg, NULL, page_size, 0);
+		sg_dma_address(sg) = page_table->pages[i]->physical_address;
+		sg_dma_len(sg) = page_size;
 	}
 
 	return 0;
@@ -302,8 +276,7 @@ static void udma_gpu_p2p_free_callback(void *data)
  *   cfg->token_id:    必填，否则 -EINVAL
  *   page_table:       NV 填充，每 entry 含 physical_address（GPU 显存 PA）
  *   seg->umem->append.sgt:
- *                     sg_page=NULL, sg_dma_address=PA, sg_dma_len=PAGE_SIZE
- *                     (64KB NV pages split to 4KB; UMMU has no 64KB leaf)
+ *                     sg_page=NULL, sg_dma_address=PA, sg_dma_len=64KB
  */
 int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 			   struct ubcore_seg_cfg *cfg)
