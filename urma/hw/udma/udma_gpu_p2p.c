@@ -25,31 +25,119 @@
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/scatterlist.h>
+#include <linux/string.h>
+#include <linux/err.h>
+#include <linux/device.h>
+#include <linux/mm.h>
 
 #include "udma_gpu_p2p.h"
 #include "udma_gpu_p2p_ops.h"
 
-static const struct udma_gpu_p2p_ops *g_gpu_p2p_ops;
+#define UDMA_GPU_SEL_AUTO	(-1)
+#define UDMA_GPU_SEL_NONE	(-2)
+
+static const struct udma_gpu_p2p_ops *g_gpu_p2p_ops[UDMA_GPU_VENDOR_MAX];
 static DEFINE_MUTEX(g_gpu_p2p_ops_lock);
+
+/*
+ * Runtime switch: which GPU card URMA GPU-seg registration uses.
+ *
+ *   auto   — exactly one registered provider (default)
+ *   metax  — 沐曦 (aliases: mx, muxi)
+ *   nvidia — NVIDIA (alias: nv)
+ *   none   — disable GPU pin
+ *
+ * Both bridges may be loaded. pin() follows this param; unpin() uses
+ * the vendor recorded on the segment.
+ *
+ *   insmod udma.ko gpu_vendor=metax
+ *   echo nvidia > /sys/module/udma/parameters/gpu_vendor
+ */
+static char gpu_vendor[16] = "auto";
+
+static int udma_gpu_parse_sel(const char *s)
+{
+	if (!s || !s[0] || !strcasecmp(s, "auto"))
+		return UDMA_GPU_SEL_AUTO;
+	if (!strcasecmp(s, "none") || !strcasecmp(s, "off"))
+		return UDMA_GPU_SEL_NONE;
+	if (!strcasecmp(s, "metax") || !strcasecmp(s, "mx") ||
+	    !strcasecmp(s, "muxi"))
+		return UDMA_GPU_VENDOR_METAX;
+	if (!strcasecmp(s, "nvidia") || !strcasecmp(s, "nv"))
+		return UDMA_GPU_VENDOR_NVIDIA;
+	return -EINVAL;
+}
+
+static const char *udma_gpu_vendor_name(int vendor)
+{
+	switch (vendor) {
+	case UDMA_GPU_VENDOR_METAX:
+		return "metax";
+	case UDMA_GPU_VENDOR_NVIDIA:
+		return "nvidia";
+	case UDMA_GPU_SEL_NONE:
+		return "none";
+	case UDMA_GPU_SEL_AUTO:
+		return "auto";
+	default:
+		return "?";
+	}
+}
+
+static int gpu_vendor_set(const char *val, const struct kernel_param *kp)
+{
+	char buf[16];
+	int sel;
+
+	if (strscpy(buf, val, sizeof(buf)) < 0)
+		return -EINVAL;
+	strim(buf);
+	sel = udma_gpu_parse_sel(buf);
+	if (sel == -EINVAL) {
+		pr_err("UDMA: invalid gpu_vendor='%s' (use auto|metax|nvidia|none)\n",
+		       buf);
+		return -EINVAL;
+	}
+	strscpy(gpu_vendor, udma_gpu_vendor_name(sel), sizeof(gpu_vendor));
+	pr_info("UDMA: gpu_vendor=%s\n", gpu_vendor);
+	return 0;
+}
+
+static int gpu_vendor_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n", gpu_vendor);
+}
+
+static const struct kernel_param_ops gpu_vendor_ops = {
+	.set = gpu_vendor_set,
+	.get = gpu_vendor_get,
+};
+
+module_param_cb(gpu_vendor, &gpu_vendor_ops, NULL, 0644);
+MODULE_PARM_DESC(gpu_vendor,
+		 "GPU card for URMA GPU segments: auto, metax, nvidia, none");
 
 int udma_register_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops)
 {
 	int ret = 0;
 
-	if (!ops || !ops->pin || !ops->unpin)
+	if (!ops || !ops->pin || !ops->unpin ||
+	    ops->vendor >= UDMA_GPU_VENDOR_MAX)
 		return -EINVAL;
 
 	mutex_lock(&g_gpu_p2p_ops_lock);
-	if (g_gpu_p2p_ops) {
-		pr_err("UDMA: GPU P2P ops already registered by %s, reject %s\n",
-		       g_gpu_p2p_ops->name ? g_gpu_p2p_ops->name : "?",
+	if (g_gpu_p2p_ops[ops->vendor]) {
+		pr_err("UDMA: GPU P2P %s already registered, reject %s\n",
+		       udma_gpu_vendor_name(ops->vendor),
 		       ops->name ? ops->name : "?");
 		ret = -EBUSY;
 		goto out;
 	}
-	g_gpu_p2p_ops = ops;
-	pr_info("UDMA: GPU P2P ops registered by %s\n",
-		ops->name ? ops->name : "?");
+	g_gpu_p2p_ops[ops->vendor] = ops;
+	pr_info("UDMA: GPU P2P ops registered by %s (gpu_vendor=%s)\n",
+		ops->name ? ops->name : udma_gpu_vendor_name(ops->vendor),
+		gpu_vendor);
 out:
 	mutex_unlock(&g_gpu_p2p_ops_lock);
 	return ret;
@@ -58,27 +146,102 @@ EXPORT_SYMBOL(udma_register_gpu_p2p_ops);
 
 void udma_unregister_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops)
 {
+	if (!ops || ops->vendor >= UDMA_GPU_VENDOR_MAX)
+		return;
+
 	mutex_lock(&g_gpu_p2p_ops_lock);
-	if (g_gpu_p2p_ops != ops) {
-		pr_warn("UDMA: udma_unregister_gpu_p2p_ops: ops pointer mismatch, ignoring\n");
+	if (g_gpu_p2p_ops[ops->vendor] != ops) {
+		pr_warn("UDMA: udma_unregister_gpu_p2p_ops: %s mismatch, ignoring\n",
+			ops->name ? ops->name : "?");
 		goto out;
 	}
-	g_gpu_p2p_ops = NULL;
-	pr_info("UDMA: GPU P2P ops unregistered\n");
+	g_gpu_p2p_ops[ops->vendor] = NULL;
+	pr_info("UDMA: GPU P2P ops unregistered (%s)\n",
+		udma_gpu_vendor_name(ops->vendor));
 out:
 	mutex_unlock(&g_gpu_p2p_ops_lock);
 }
 EXPORT_SYMBOL(udma_unregister_gpu_p2p_ops);
 
-static const struct udma_gpu_p2p_ops *udma_gpu_p2p_ops_get(void)
+static const struct udma_gpu_p2p_ops *
+udma_gpu_p2p_try_get_slot(enum udma_gpu_vendor vendor)
+{
+	const struct udma_gpu_p2p_ops *ops;
+
+	if (vendor >= UDMA_GPU_VENDOR_MAX)
+		return NULL;
+	ops = g_gpu_p2p_ops[vendor];
+	if (ops && !try_module_get(ops->owner))
+		return NULL;
+	return ops;
+}
+
+static const struct udma_gpu_p2p_ops *
+udma_gpu_p2p_ops_get_slot(enum udma_gpu_vendor vendor)
 {
 	const struct udma_gpu_p2p_ops *ops;
 
 	mutex_lock(&g_gpu_p2p_ops_lock);
-	ops = g_gpu_p2p_ops;
-	if (ops && !try_module_get(ops->owner))
-		ops = NULL;
+	ops = udma_gpu_p2p_try_get_slot(vendor);
 	mutex_unlock(&g_gpu_p2p_ops_lock);
+	return ops;
+}
+
+static const struct udma_gpu_p2p_ops *
+udma_gpu_p2p_ops_get_selected(struct device *dev)
+{
+	const struct udma_gpu_p2p_ops *ops = NULL;
+	int sel, i, found = -1, n = 0;
+
+	sel = udma_gpu_parse_sel(gpu_vendor);
+	if (sel == -EINVAL) {
+		dev_err(dev, "invalid gpu_vendor=%s (use auto|metax|nvidia|none)\n",
+			gpu_vendor);
+		return ERR_PTR(-EINVAL);
+	}
+	if (sel == UDMA_GPU_SEL_NONE) {
+		dev_err(dev, "GPU pin disabled (gpu_vendor=none)\n");
+		return ERR_PTR(-ENODEV);
+	}
+
+	mutex_lock(&g_gpu_p2p_ops_lock);
+	if (sel >= 0) {
+		ops = udma_gpu_p2p_try_get_slot(sel);
+		mutex_unlock(&g_gpu_p2p_ops_lock);
+		if (!ops) {
+			dev_err(dev,
+				"gpu_vendor=%s but %s provider is not registered "
+				"(load the matching udma_*_p2p_bridge.ko)\n",
+				gpu_vendor, udma_gpu_vendor_name(sel));
+			return ERR_PTR(-ENODEV);
+		}
+		return ops;
+	}
+
+	for (i = 0; i < UDMA_GPU_VENDOR_MAX; i++) {
+		if (g_gpu_p2p_ops[i]) {
+			n++;
+			found = i;
+		}
+	}
+	if (n == 1)
+		ops = udma_gpu_p2p_try_get_slot(found);
+	mutex_unlock(&g_gpu_p2p_ops_lock);
+
+	if (n == 0) {
+		dev_err(dev, "GPU P2P provider not registered "
+			"(load udma_metax_p2p_bridge.ko or udma_nv_p2p_bridge.ko, "
+			"then set gpu_vendor=metax|nvidia if both are loaded)\n");
+		return ERR_PTR(-ENODEV);
+	}
+	if (n > 1) {
+		dev_err(dev,
+			"both metax and nvidia GPU providers are registered; "
+			"set gpu_vendor=metax or gpu_vendor=nvidia\n");
+		return ERR_PTR(-EINVAL);
+	}
+	if (!ops)
+		return ERR_PTR(-ENODEV);
 	return ops;
 }
 
@@ -133,12 +296,9 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 		return -EINVAL;
 	}
 
-	ops = udma_gpu_p2p_ops_get();
-	if (!ops) {
-		dev_err(dev->dev, "GPU P2P provider not registered "
-			"(load udma_metax_p2p_bridge.ko or udma_nv_p2p_bridge.ko)\n");
-		return -ENODEV;
-	}
+	ops = udma_gpu_p2p_ops_get_selected(dev->dev);
+	if (IS_ERR(ops))
+		return PTR_ERR(ops);
 
 	ret = ops->pin(cfg->va, cfg->len, udma_gpu_invalidate, seg, &pin);
 	if (ret) {
@@ -172,6 +332,7 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 	seg->umem->append.sgt = pin.sgt;
 
 	seg->gpu.handle = pin.handle;
+	seg->gpu.vendor = ops->vendor;
 	seg->gpu.gpu_va = pin.gpu_va;
 	seg->gpu.mapped_size = pin.mapped_size;
 	seg->gpu.page_size = pin.page_size;
@@ -205,7 +366,7 @@ void udma_gpu_unpin_seg_pages(struct udma_segment *seg)
 	handle = xchg(&seg->gpu.handle, NULL);
 
 	if (handle) {
-		ops = udma_gpu_p2p_ops_get();
+		ops = udma_gpu_p2p_ops_get_slot(seg->gpu.vendor);
 		if (ops) {
 			ops->unpin(handle, seg->gpu.gpu_va, recycled);
 			udma_gpu_p2p_ops_put(ops);

@@ -198,6 +198,7 @@ static void udma_metax_unpin(void *handle, uint64_t gpu_va, bool recycled)
 }
 
 static const struct udma_gpu_p2p_ops udma_metax_p2p_bridge_ops = {
+	.vendor = UDMA_GPU_VENDOR_METAX,
 	.name = "metax",
 	.owner = THIS_MODULE,
 	.recycles_handle = true,
@@ -212,8 +213,7 @@ static int __init udma_metax_p2p_bridge_init(void)
 	ret = udma_register_gpu_p2p_ops(&udma_metax_p2p_bridge_ops);
 	if (ret) {
 		pr_err("udma_register_gpu_p2p_ops failed ret=%d "
-		       "(is udma.ko loaded first? another GPU provider already registered?)\n",
-		       ret);
+		       "(is udma.ko loaded first?)\n", ret);
 		return ret;
 	}
 

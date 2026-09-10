@@ -9,7 +9,8 @@
  * bit on its tmp_cfg copy.
  *
  * The actual GPU pages come from a registered vendor provider
- * (see udma_gpu_p2p_ops.h): MetaX acquire/get_mem or NVIDIA get_pages.
+ * (see udma_gpu_p2p_ops.h). Which card is used is udma.ko module
+ * param gpu_vendor=auto|metax|nvidia|none.
  */
 
 #ifndef __UDMA_GPU_P2P_H__

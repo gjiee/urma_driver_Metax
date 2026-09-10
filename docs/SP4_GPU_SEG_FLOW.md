@@ -290,18 +290,24 @@ void (*unpin)(handle, gpu_va, recycled);
   → ummu_sva_matt_map_phys_sg(gpu_va, sgt)
 ```
 
-加载（二选一，不能同时注册两个 provider）：
+两个 bridge 可以同时加载。用 `udma.ko` 的模块参数选卡：
 
 ```bash
 # 沐曦
-insmod mxcd.ko          # 或实际的 MetaX 模块名
-insmod udma.ko
+insmod mxcd.ko
+insmod udma.ko gpu_vendor=metax
 insmod udma_metax_p2p_bridge.ko
 
 # NVIDIA
 insmod nvidia.ko
-insmod udma.ko
+insmod udma.ko gpu_vendor=nvidia
 insmod udma_nv_p2p_bridge.ko
+
+# 运行中切换（已注册的段仍按 pin 时的厂商 unpin）
+echo metax  > /sys/module/udma/parameters/gpu_vendor
+echo nvidia > /sys/module/udma/parameters/gpu_vendor
 ```
+
+`gpu_vendor` 取值：`auto`（默认，恰好一个 provider 时用它；两个都在必须显式选）、`metax`（别名 `mx`/`muxi`）、`nvidia`（别名 `nv`）、`none`。
 
 没有 NVIDIA 头文件时 **不再** 把 `UDMA_GPU_P2P_ENABLE=0`：`udma.ko` 始终带 GPU pin，只是没装 bridge 时返回 `-ENODEV`。沐曦机器因此能编出和 NVIDIA 机器同一份 `udma.ko`。

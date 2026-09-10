@@ -21,6 +21,13 @@
 #include <linux/scatterlist.h>
 #include <linux/module.h>
 
+/* Slots in udma.ko. Selected at runtime by module param gpu_vendor. */
+enum udma_gpu_vendor {
+	UDMA_GPU_VENDOR_METAX = 0,
+	UDMA_GPU_VENDOR_NVIDIA,
+	UDMA_GPU_VENDOR_MAX
+};
+
 /*
  * One successful vendor pin.
  *
@@ -42,6 +49,7 @@ struct udma_gpu_p2p_pin {
 };
 
 struct udma_gpu_p2p_ops {
+	enum udma_gpu_vendor vendor;
 	const char *name;
 	struct module *owner;
 	/* MetaX recycle kfree()s the handle after invalidate; NVIDIA does not. */

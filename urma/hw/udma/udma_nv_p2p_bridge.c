@@ -313,6 +313,7 @@ static void udma_nv_unpin(void *handle, uint64_t gpu_va, bool recycled)
 }
 
 static const struct udma_gpu_p2p_ops udma_nv_p2p_bridge_ops = {
+	.vendor = UDMA_GPU_VENDOR_NVIDIA,
 	.name = "nvidia",
 	.owner = THIS_MODULE,
 	.recycles_handle = false,

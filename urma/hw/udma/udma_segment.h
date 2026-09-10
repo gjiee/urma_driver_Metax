@@ -17,11 +17,13 @@
  * mapped_size: aligned pin length
  * page_size:   vendor GPU page (MetaX variable, NVIDIA 64KB)
  * bus_offset:  MetaX aper_base - pci_bus_base; 0 for NVIDIA
+ * vendor:      which provider pinned this seg (unpin must use the same)
  * force_freed: vendor invalidate ran (early GPU free)
  * matt_mapped: isolated SVA installed a phys-SG overlay
  */
 struct udma_gpu_p2p_mem {
 	void *handle;
+	u8 vendor;
 	uint64_t gpu_va;
 	uint64_t mapped_size;
 	uint32_t page_size;
