@@ -2,7 +2,7 @@
 /* Copyright(c) 2025 HiSilicon Technologies CO., Ltd. All rights reserved. */
 /*
  * GPU兼容测试补丁 — SP4 (openEuler-24.03-LTS-SP4 同步版)
- * 扩展 udma_segment 以保存 GPU pin 状态（page_table / gpu_va）
+ * GPU pin state lives in struct udma_gpu_p2p_mem (vendor handle + VA).
  */
 
 #ifndef __UDMA_SEGMENT_H__
@@ -10,28 +10,22 @@
 
 #include "udma_dev.h"
 
-//GPU兼容测试补丁: NV P2P 页表类型，完整定义在 nv-p2p.h
-struct nvidia_p2p_page_table;
-
 /*
- * GPU兼容测试补丁: GPU 段 pin 后的持久化状态
- * page_table:  nvidia_p2p_get_pages() 返回值，unpin 时 nvidia_p2p_put_pages() 归还
- * gpu_va:      64KB 对齐后的 pin 起始 VA（= seg->addr），nvidia_p2p_put_pages()
- *              的 virtual_address 参数也用它
- * mapped_size: 实际 pin 的字节长度（= seg->length）
- * force_freed: NV 侧异步 free_callback 被调用后置位（GPU 内存被 App 提前释放，
- *              而 URMA 段还没 unregister）。置位后 unpin 路径不再调用
- *              nvidia_p2p_put_pages()（page_table 已经被 NV 内部释放，
- *              重复调用未定义），只做本地清理。
- *              这是 TODO：正确做法应该在此时通知 ubcore/上层使该段失效，
- *              当前测试补丁只打印错误日志，不做进一步传播。
- * matt_mapped: isolated SVA (sva_sep_mode_en == 0) 下已为该 GPU VA 安装
- *              MATT physical-SG overlay。unregister 时必须先 unmap 再 unpin。
+ * GPU pin state after a vendor provider returns.
+ * handle:      vendor-opaque (MetaX mem_reg / NVIDIA wrapper)
+ * gpu_va:      aligned pin start, also the UMMU IOVA key
+ * mapped_size: aligned pin length
+ * page_size:   vendor GPU page (MetaX variable, NVIDIA 64KB)
+ * bus_offset:  MetaX aper_base - pci_bus_base; 0 for NVIDIA
+ * force_freed: vendor invalidate ran (early GPU free)
+ * matt_mapped: isolated SVA installed a phys-SG overlay
  */
 struct udma_gpu_p2p_mem {
-	struct nvidia_p2p_page_table *page_table;
+	void *handle;
 	uint64_t gpu_va;
 	uint64_t mapped_size;
+	uint32_t page_size;
+	uint64_t bus_offset;
 	bool force_freed;
 	bool matt_mapped;
 };
@@ -43,7 +37,6 @@ struct udma_segment {
 	uint32_t token_value;
 	bool token_value_valid;
 	bool kernel_mode;
-	//GPU兼容测试补丁: true 表示本段通过 UBCORE_REG_SEG_GPU_VA 注册
 	bool is_gpu_seg;
 	uint32_t tid;
 	uint64_t addr;

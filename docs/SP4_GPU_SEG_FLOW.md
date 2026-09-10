@@ -248,3 +248,60 @@ insmod urma/hw/udma/udma_nv_p2p_bridge.ko
 ```
 
 `udma_nv_p2p_bridge.ko` 已声明 `MODULE_SOFTDEP("pre: nvidia udma")`，`modprobe` 会自动处理前两个依赖；`insmod` 仍需手动按上面顺序。
+
+---
+
+## 6. GPU 注册 v3：厂商无关 pin + 沐曦 (MetaX) 适配
+
+NVIDIA `get_pages` → page_table 不是唯一的 GPU ABI。沐曦导出的是更干净的两段式接口：
+
+```c
+metax_p2p_acquire_mem(va, len, &handle, invalidate, arg);
+metax_p2p_get_mem(handle, &sgt);          /* 现成 sg_table */
+metax_p2p_put_mem(handle, sgt);
+metax_p2p_release_mem(handle);
+/* 另有 get_pci_dev / get_bus_offset / get_page_size */
+```
+
+和 NVIDIA 的关键差别：
+
+| | NVIDIA | MetaX |
+|---|---|---|
+| 对齐 | 64KB | `PAGE_SIZE`（acquire 内部再对齐） |
+| 页表形态 | `nvidia_p2p_page_table`，本地拼 SG | 驱动直接给 `sg_table` |
+| 失效回调 | `void (*)(void *)` | `int (*)(void *)`；recycle 后 **kfree handle** |
+| `pci_dev` / `bus_offset` | 无（给的就是 BAR PA） | 有。UB 不是 PCI 设备，**不用** `dma_map`；`bus_offset` 仅在 `apply_bus_offset=1` 时加到 PA 上 |
+
+`udma.ko` 不再认识任何厂商类型。契约在 `udma_gpu_p2p_ops.h`：
+
+```c
+int  (*pin)(va, len, invalidate, arg, struct udma_gpu_p2p_pin *out);
+void (*unpin)(handle, gpu_va, recycled);
+```
+
+`pin()` 必须交出 **UMMU 可用的 phys SG**（`sg_page=NULL`，`sg_dma_address=PA`）。
+
+```
+用户态 is_gpu_seg=1（udrv_data，不变）
+  → ubcore 原样校验
+  → udma_gpu_pin_seg_pages()
+       ops->pin()     // MetaX 或 NVIDIA bridge
+       接管 out.sgt
+  → ummu_sva_matt_map_phys_sg(gpu_va, sgt)
+```
+
+加载（二选一，不能同时注册两个 provider）：
+
+```bash
+# 沐曦
+insmod mxcd.ko          # 或实际的 MetaX 模块名
+insmod udma.ko
+insmod udma_metax_p2p_bridge.ko
+
+# NVIDIA
+insmod nvidia.ko
+insmod udma.ko
+insmod udma_nv_p2p_bridge.ko
+```
+
+没有 NVIDIA 头文件时 **不再** 把 `UDMA_GPU_P2P_ENABLE=0`：`udma.ko` 始终带 GPU pin，只是没装 bridge 时返回 `-ENODEV`。沐曦机器因此能编出和 NVIDIA 机器同一份 `udma.ko`。

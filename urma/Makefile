@@ -11,31 +11,29 @@ REPO_ROOT ?= $(abspath $(CURDIR)/..)
 
 NV_P2P_HEADER_PATH ?= $(abspath $(REPO_ROOT)/../nv_module_netlab/kernel-open/nvidia)
 NV_MODULE_SYMVERS  ?= $(NV_P2P_HEADER_PATH)/Module.symvers
+METAX_MODULE_SYMVERS ?=
 UBASE_MODULE_SYMVERS ?= $(REPO_ROOT)/ubase/Module.symvers
 
 export NV_P2P_HEADER_PATH
 export NV_MODULE_SYMVERS
+export METAX_MODULE_SYMVERS
 export UBASE_MODULE_SYMVERS
 
 .PHONY: all modules clean check-nv-symvers
 all: modules
 
-# FIX: NV 相关检查从"硬性要求、缺了就 exit 1 整个编译失败"改成
-# "探测到就校验、探测不到就打个 WARNING 自动跳过 GPU P2P 那部分"。
-# 没有 GPU/没装 NVIDIA 驱动源码的机器（比如跨节点测试里作为纯 client
-# 的对端）现在也能编译出功能完整（除了 GPU pin 走 -ENOTSUPP stub）的
-# udma.ko/ubcore.ko 等一整套模块——这对保证两端内核模块版本一致、避免
-# 跨节点协议不兼容非常重要，参见 udma_gpu_p2p.h/.c 的 UDMA_GPU_P2P_ENABLE。
+# NVIDIA headers are optional. udma.ko always has GPU pin (needs a
+# loaded vendor bridge at runtime). Missing nv-p2p.h only skips
+# udma_nv_p2p_bridge.ko; udma_metax_p2p_bridge.ko still builds.
 HAVE_NV_P2P_HEADER := $(if $(wildcard $(NV_P2P_HEADER_PATH)/nv-p2p.h),1,0)
 HAVE_NV_SYMVERS := $(if $(and $(filter 1,$(HAVE_NV_P2P_HEADER)),$(wildcard $(NV_MODULE_SYMVERS))),1,0)
 
 check-nv-symvers:
 ifeq ($(HAVE_NV_P2P_HEADER),0)
 	@echo "WARNING: nv-p2p.h not found under $(NV_P2P_HEADER_PATH)."
-	@echo "  Building WITHOUT GPU P2P support: udma.ko will compile with"
-	@echo "  UDMA_GPU_P2P_ENABLE=0 (GPU pin path returns -ENOTSUPP, all"
-	@echo "  other HOST-segment functionality is unaffected), and"
+	@echo "  udma.ko still builds with GPU pin (vendor-neutral)."
 	@echo "  udma_nv_p2p_bridge.ko will NOT be built."
+	@echo "  udma_metax_p2p_bridge.ko will still be built."
 else
 	@test -f "$(NV_MODULE_SYMVERS)" || { \
 		echo "WARNING: $(NV_MODULE_SYMVERS) not found."; \
@@ -47,7 +45,9 @@ else
 		echo "WARNING: nvidia_p2p_get_pages not found in $(NV_MODULE_SYMVERS), same as above."; }
 endif
 
-EXTRA_KBUILD_SYMVERS := $(if $(filter 1,$(HAVE_NV_SYMVERS)),$(abspath $(NV_MODULE_SYMVERS)),) $(if $(wildcard $(UBASE_MODULE_SYMVERS)),$(abspath $(UBASE_MODULE_SYMVERS)),)
+EXTRA_KBUILD_SYMVERS := $(if $(filter 1,$(HAVE_NV_SYMVERS)),$(abspath $(NV_MODULE_SYMVERS)),) \
+	$(if $(wildcard $(METAX_MODULE_SYMVERS)),$(abspath $(METAX_MODULE_SYMVERS)),) \
+	$(if $(wildcard $(UBASE_MODULE_SYMVERS)),$(abspath $(UBASE_MODULE_SYMVERS)),)
 
 modules: check-nv-symvers
 	mkdir -p $(BUILD_DIR)
@@ -71,6 +71,9 @@ else
 
 ifneq ($(NV_MODULE_SYMVERS),)
 KBUILD_EXTRA_SYMBOLS += $(NV_MODULE_SYMVERS)
+endif
+ifneq ($(METAX_MODULE_SYMVERS),)
+KBUILD_EXTRA_SYMBOLS += $(METAX_MODULE_SYMVERS)
 endif
 ifneq ($(UBASE_MODULE_SYMVERS),)
 KBUILD_EXTRA_SYMBOLS += $(UBASE_MODULE_SYMVERS)

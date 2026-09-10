@@ -25,9 +25,21 @@
 
 #include <linux/module.h>
 #include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/scatterlist.h>
 #include <nv-p2p.h>
 
-#include "udma_nv_p2p_bridge.h"
+#include "udma_gpu_p2p_ops.h"
+
+#define UDMA_NV_P2P_PAGE_SHIFT	16
+#define UDMA_NV_P2P_PAGE_SIZE	((uint64_t)1 << UDMA_NV_P2P_PAGE_SHIFT)
+#define UDMA_NV_P2P_PAGE_MASK	(~(UDMA_NV_P2P_PAGE_SIZE - 1))
+
+struct udma_nv_handle {
+	struct nvidia_p2p_page_table *pt;
+	int (*invalidate)(void *arg);
+	void *arg;
+};
 /*
 static int udma_nv_p2p_bridge_get_pages(uint64_t gpu_va, uint64_t length,
 					struct nvidia_p2p_page_table **page_table,
@@ -195,22 +207,117 @@ udma_nv_p2p_bridge_get_pages(uint64_t gpu_va, uint64_t length,
         return 0;
 }
 
-static int udma_nv_p2p_bridge_put_pages(uint64_t gpu_va,
-					struct nvidia_p2p_page_table *page_table)
+static uint64_t udma_nv_align_len(uint64_t addr, uint64_t len)
 {
-	return nvidia_p2p_put_pages(0, 0, gpu_va, page_table);
+	uint64_t end;
+
+	end = (addr + len + UDMA_NV_P2P_PAGE_SIZE - 1) & UDMA_NV_P2P_PAGE_MASK;
+	return end - (addr & UDMA_NV_P2P_PAGE_MASK);
 }
 
-static int udma_nv_p2p_bridge_free_page_table(struct nvidia_p2p_page_table *page_table)
+static int udma_nv_build_phys_sgt(struct nvidia_p2p_page_table *pt,
+				  struct sg_table *sgt)
 {
-	return nvidia_p2p_free_page_table(page_table);
+	struct scatterlist *sg;
+	uint32_t i;
+	int ret;
+
+	if (pt->page_size != NVIDIA_P2P_PAGE_SIZE_64KB)
+		return -EINVAL;
+
+	ret = sg_alloc_table(sgt, pt->entries, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	for_each_sg(sgt->sgl, sg, pt->entries, i) {
+		sg_set_page(sg, NULL, UDMA_NV_P2P_PAGE_SIZE, 0);
+		sg_dma_address(sg) = pt->pages[i]->physical_address;
+		sg_dma_len(sg) = UDMA_NV_P2P_PAGE_SIZE;
+	}
+
+	return 0;
+}
+
+static void udma_nv_free_cb(void *data)
+{
+	struct udma_nv_handle *h = data;
+
+	if (!h)
+		return;
+	if (h->invalidate)
+		h->invalidate(h->arg);
+	h->pt = NULL;
+}
+
+static int udma_nv_pin(uint64_t va, uint64_t len,
+		       int (*invalidate)(void *arg), void *arg,
+		       struct udma_gpu_p2p_pin *out)
+{
+	struct udma_nv_handle *h;
+	uint64_t gpu_va, mapped_size;
+	int ret;
+
+	gpu_va = va & UDMA_NV_P2P_PAGE_MASK;
+	mapped_size = udma_nv_align_len(va, len);
+	if (!mapped_size)
+		return -EINVAL;
+
+	h = kzalloc(sizeof(*h), GFP_KERNEL);
+	if (!h)
+		return -ENOMEM;
+
+	h->invalidate = invalidate;
+	h->arg = arg;
+
+	ret = udma_nv_p2p_bridge_get_pages(gpu_va, mapped_size, &h->pt,
+					   udma_nv_free_cb, h);
+	if (ret) {
+		kfree(h);
+		return ret;
+	}
+
+	if (!h->pt || !h->pt->entries) {
+		nvidia_p2p_put_pages(0, 0, gpu_va, h->pt);
+		kfree(h);
+		return -EINVAL;
+	}
+
+	ret = udma_nv_build_phys_sgt(h->pt, &out->sgt);
+	if (ret) {
+		nvidia_p2p_put_pages(0, 0, gpu_va, h->pt);
+		kfree(h);
+		return ret;
+	}
+
+	out->handle = h;
+	out->gpu_va = gpu_va;
+	out->mapped_size = mapped_size;
+	out->page_size = UDMA_NV_P2P_PAGE_SIZE;
+	out->bus_offset = 0;
+	return 0;
+}
+
+static void udma_nv_unpin(void *handle, uint64_t gpu_va, bool recycled)
+{
+	struct udma_nv_handle *h = handle;
+
+	if (!h)
+		return;
+
+	if (h->pt && !recycled)
+		nvidia_p2p_put_pages(0, 0, gpu_va, h->pt);
+	else if (h->pt)
+		nvidia_p2p_free_page_table(h->pt);
+
+	kfree(h);
 }
 
 static const struct udma_gpu_p2p_ops udma_nv_p2p_bridge_ops = {
-	.get_pages = udma_nv_p2p_bridge_get_pages,
-	.put_pages = udma_nv_p2p_bridge_put_pages,
-	.free_page_table = udma_nv_p2p_bridge_free_page_table,
+	.name = "nvidia",
 	.owner = THIS_MODULE,
+	.recycles_handle = false,
+	.pin = udma_nv_pin,
+	.unpin = udma_nv_unpin,
 };
 
 static int __init udma_nv_p2p_bridge_init(void)
