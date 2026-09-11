@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0+
 
-# GPU P2P: udma.ko is vendor-neutral (no nv-p2p.h / no metax headers).
+# GPU P2P: udma.ko is vendor-neutral.
 # Missing vendor artifacts must NOT disable GPU pin.
 #   NVIDIA bridge: needs nv-p2p.h
-#   MetaX bridge:  needs extra/Module.symvers (prototypes are local)
+#   MetaX bridge:  needs extra/Module.symvers
 NV_P2P_HEADER_PATH ?=
 METAX_MODULE_SYMVERS ?=
 HAVE_NV_P2P_HEADER := $(if $(wildcard $(NV_P2P_HEADER_PATH)/nv-p2p.h),1,0)

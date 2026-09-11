@@ -14,12 +14,10 @@ REPO_ROOT ?= $(abspath $(CURDIR)/..)
 NV_P2P_HEADER_PATH ?= $(abspath $(REPO_ROOT)/../nv_module_netlab/kernel-open/nvidia)
 NV_MODULE_SYMVERS  ?= $(NV_P2P_HEADER_PATH)/Module.symvers
 
-# MetaX: 已安装的 KMD，不走 /usr/src 头文件。
-# 服务器 extra/ 里同时有 metax.ko.xz 和 Module.symvers：
+# MetaX: 已安装的 KMD（modinfo: metax 3.8.23, GPL）。
 #   /lib/modules/<kver>/extra/metax.ko.xz
 #   /lib/modules/<kver>/extra/Module.symvers
-# 模块名 metax，version 3.8.23，GPL。
-# P2P 原型用本仓库 urma/hw/udma/udma_metax_p2p.h。
+# 不引用 /usr/src 或独立 metax_p2p.h；P2P 原型写在 bridge .c 里。
 METAX_KMOD_DIR ?= /lib/modules/$(shell uname -r)/extra
 METAX_KMOD ?= $(METAX_KMOD_DIR)/metax.ko.xz
 METAX_MODULE_SYMVERS ?= $(METAX_KMOD_DIR)/Module.symvers
@@ -73,7 +71,6 @@ else
 	}
 	@grep -q metax_p2p_acquire_mem "$(METAX_MODULE_SYMVERS)" || { \
 		echo "WARNING: metax_p2p_acquire_mem not in $(METAX_MODULE_SYMVERS)."; \
-		echo "  Bridge still builds against local udma_metax_p2p.h;"; \
 		echo "  insmod may fail if this Module.symvers is not from metax.ko."; \
 	}
 endif

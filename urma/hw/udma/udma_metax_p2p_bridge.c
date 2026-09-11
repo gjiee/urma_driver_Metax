@@ -29,7 +29,18 @@
 #include <linux/mm.h>
 
 #include "udma_gpu_p2p_ops.h"
-#include "udma_metax_p2p.h"
+
+/*
+ * Exports from installed metax.ko
+ * (/lib/modules/$(uname -r)/extra/metax.ko.xz). Linked via extra/Module.symvers.
+ */
+int metax_p2p_acquire_mem(uint64_t addr, size_t size, void **handle,
+			  int (*callback)(void *arg), void *arg);
+void metax_p2p_release_mem(void *handle);
+int metax_p2p_get_mem(void *handle, struct sg_table **sgt);
+int metax_p2p_put_mem(void *handle, struct sg_table *sgt);
+uint64_t metax_p2p_get_bus_offset(void *handle);
+uint32_t metax_p2p_get_page_size(void *handle);
 
 static bool apply_bus_offset;
 module_param(apply_bus_offset, bool, 0644);
