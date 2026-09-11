@@ -17,7 +17,7 @@
  * added to each PA. Default is pass-through; set apply_bus_offset=1
  * if the vendor sgt holds PCI bus addresses instead of BAR PAs.
  *
- * Load order: metax/mxcd.ko -> udma.ko -> udma_metax_p2p_bridge.ko
+ * Load order: metax.ko -> udma.ko -> udma_metax_p2p_bridge.ko
  */
 
 #define pr_fmt(fmt) "udma_metax_p2p_bridge: " fmt
@@ -234,7 +234,7 @@ static void __exit udma_metax_p2p_bridge_exit(void)
 module_init(udma_metax_p2p_bridge_init);
 module_exit(udma_metax_p2p_bridge_exit);
 
-MODULE_SOFTDEP("pre: udma");
+MODULE_SOFTDEP("pre: metax udma");
 MODULE_DESCRIPTION("UDMA <-> MetaX GPU P2P bridge (acquire/get_mem → phys SG)");
 MODULE_AUTHOR("HiSilicon Tech. Co., Ltd.");
 MODULE_LICENSE("GPL");

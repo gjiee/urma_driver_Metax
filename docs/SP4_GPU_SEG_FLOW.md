@@ -305,7 +305,7 @@ void (*unpin)(handle, gpu_va, recycled);
 
 ```bash
 # 沐曦
-insmod mxcd.ko
+insmod metax.ko
 insmod udma.ko gpu_vendor=metax
 insmod udma_metax_p2p_bridge.ko
 

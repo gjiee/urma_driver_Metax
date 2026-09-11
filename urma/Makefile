@@ -14,18 +14,27 @@ REPO_ROOT ?= $(abspath $(CURDIR)/..)
 NV_P2P_HEADER_PATH ?= $(abspath $(REPO_ROOT)/../nv_module_netlab/kernel-open/nvidia)
 NV_MODULE_SYMVERS  ?= $(NV_P2P_HEADER_PATH)/Module.symvers
 
-# MetaX: 系统安装的沐曦内核接口（用户指定）
+# MetaX GPU KMD（来自服务器 modinfo metax）:
+#   filename: /lib/modules/<kver>/extra/metax.ko.xz
+#   version:  3.8.23
+#   license:  GPL
+#   模块名:   metax（不是 mxcd）
+# 编译用头文件（用户指定）:
 #   /usr/src/metax-1inux-3.8.23/interface/metax/metax_p2p.h
-METAX_SRC ?= /usr/src/metax-1inux-3.8.23
+METAX_VERSION ?= 3.8.23
+METAX_SRC ?= /usr/src/metax-1inux-$(METAX_VERSION)
 METAX_P2P_HEADER_PATH ?= $(METAX_SRC)/interface/metax
+METAX_KMOD ?= /lib/modules/$(shell uname -r)/extra/metax.ko.xz
 METAX_MODULE_SYMVERS ?= $(METAX_SRC)/Module.symvers
 
 UBASE_MODULE_SYMVERS ?= $(REPO_ROOT)/ubase/Module.symvers
 
 export NV_P2P_HEADER_PATH
 export NV_MODULE_SYMVERS
+export METAX_VERSION
 export METAX_SRC
 export METAX_P2P_HEADER_PATH
+export METAX_KMOD
 export METAX_MODULE_SYMVERS
 export UBASE_MODULE_SYMVERS
 
@@ -96,8 +105,10 @@ show-vars:
 	@echo NV_P2P_HEADER_PATH=$(NV_P2P_HEADER_PATH)
 	@echo NV_MODULE_SYMVERS=$(NV_MODULE_SYMVERS)
 	@echo HAVE_NV_P2P_HEADER=$(HAVE_NV_P2P_HEADER)
+	@echo METAX_VERSION=$(METAX_VERSION)
 	@echo METAX_SRC=$(METAX_SRC)
 	@echo METAX_P2P_HEADER_PATH=$(METAX_P2P_HEADER_PATH)
+	@echo METAX_KMOD=$(METAX_KMOD)
 	@echo METAX_MODULE_SYMVERS=$(METAX_MODULE_SYMVERS)
 	@echo HAVE_METAX_P2P_HEADER=$(HAVE_METAX_P2P_HEADER)
 	@echo UBASE_MODULE_SYMVERS=$(UBASE_MODULE_SYMVERS)
