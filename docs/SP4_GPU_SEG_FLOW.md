@@ -232,12 +232,15 @@ make NV_P2P_HEADER_PATH=/path/to/nv-p2p-header-dir \
      NV_MODULE_SYMVERS=/path/to/your/nvidia/Module.symvers
 ```
 
-`urma/` 单独编译：
+`urma/` 单独编译。NVIDIA / 沐曦路径都是探测出来的，不要的可以不传；只编沐曦时：
 
 ```bash
 cd urma
-make NV_P2P_HEADER_PATH=... NV_MODULE_SYMVERS=...
+make METAX_MODULE_SYMVERS=/path/to/metax/Module.symvers
+# 或 make METAX_SRC=/path/to/metax-driver
 ```
+
+NVIDIA 机器再加 `NV_P2P_HEADER_PATH` / `NV_MODULE_SYMVERS`。`make show-vars` 可看探测结果。
 
 加载顺序（三级，注意 `udma_nv_p2p_bridge.ko` 最后装）：
 
