@@ -1,11 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 /*
- * Minimal MetaX P2P declarations used by udma_metax_p2p_bridge.ko.
- * Matches the public EXPORT_SYMBOL ABI from the MetaX GPU driver
- * (metax_p2p_acquire_mem / get_mem / put_mem / release_mem / ...).
- *
- * This repo does not ship MetaX headers. Keep this surface tiny so the
- * bridge builds without the vendor tree.
+ * Fallback MetaX P2P declarations used only when the vendor header is
+ * not on the include path. The live header is:
+ *   /usr/src/metax-1inux-3.8.23/interface/metax/metax_p2p.h
+ * wired by METAX_P2P_HEADER_PATH in urma/Makefile.
  */
 
 #ifndef __UDMA_METAX_P2P_H__
