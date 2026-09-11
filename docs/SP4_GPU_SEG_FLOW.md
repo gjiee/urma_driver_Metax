@@ -318,6 +318,6 @@ echo metax  > /sys/module/udma/parameters/gpu_vendor
 echo nvidia > /sys/module/udma/parameters/gpu_vendor
 ```
 
-`gpu_vendor` 取值：`auto`（默认，恰好一个 provider 时用它；两个都在必须显式选）、`metax`（别名 `mx`/`muxi`）、`nvidia`（别名 `nv`）、`none`。
+`gpu_vendor` 取值：`auto`（默认，恰好一个 provider 时用它；两个都在必须显式选）、`metax`、`nvidia`（别名 `nv`）、`none`。
 
 没有 NVIDIA 头文件时 **不再** 把 `UDMA_GPU_P2P_ENABLE=0`：`udma.ko` 始终带 GPU pin，只是没装 bridge 时返回 `-ENODEV`。沐曦机器因此能编出和 NVIDIA 机器同一份 `udma.ko`。

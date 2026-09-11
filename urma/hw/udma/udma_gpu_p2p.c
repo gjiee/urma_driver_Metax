@@ -43,7 +43,7 @@ static DEFINE_MUTEX(g_gpu_p2p_ops_lock);
  * Runtime switch: which GPU card URMA GPU-seg registration uses.
  *
  *   auto   — exactly one registered provider (default)
- *   metax  — 沐曦 (aliases: mx, muxi)
+ *   metax  — 沐曦
  *   nvidia — NVIDIA (alias: nv)
  *   none   — disable GPU pin
  *
@@ -61,8 +61,7 @@ static int udma_gpu_parse_sel(const char *s)
 		return UDMA_GPU_SEL_AUTO;
 	if (!strcasecmp(s, "none") || !strcasecmp(s, "off"))
 		return UDMA_GPU_SEL_NONE;
-	if (!strcasecmp(s, "metax") || !strcasecmp(s, "mx") ||
-	    !strcasecmp(s, "muxi"))
+	if (!strcasecmp(s, "metax"))
 		return UDMA_GPU_VENDOR_METAX;
 	if (!strcasecmp(s, "nvidia") || !strcasecmp(s, "nv"))
 		return UDMA_GPU_VENDOR_NVIDIA;
