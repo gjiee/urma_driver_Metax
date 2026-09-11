@@ -12,6 +12,9 @@ HAVE_METAX_SYMVERS := $(if $(wildcard $(METAX_MODULE_SYMVERS)),1,0)
 ifeq ($(HAVE_NV_P2P_HEADER),1)
 ccflags-y += -I$(NV_P2P_HEADER_PATH)
 endif
+ifeq ($(UDMA_HAVE_UMMU_MATT_PHYS_SG),1)
+ccflags-y += -DUDMA_HAVE_UMMU_MATT_PHYS_SG=1
+endif
 
 udma-$(CONFIG_UB_UDMA) := udma_main.o udma_cmd.o udma_common.o udma_ctx.o udma_db.o \
 	     udma_tid.o udma_eq.o udma_jfc.o \
