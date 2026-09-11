@@ -28,6 +28,9 @@
 /*
  * Must match UMDK struct udma_register_seg_ucmd
  * (src/urma/hw/udma/udma_u_segment.c).
+ *
+ * reserved stays 0. Do not put a GPU vendor id here: pin dispatch is
+ * udma.ko module param gpu_vendor=auto|metax|nvidia|none, not udrv_data.
  */
 struct udma_register_seg_ucmd {
 	uint32_t is_gpu_seg;

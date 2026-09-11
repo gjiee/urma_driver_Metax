@@ -43,8 +43,9 @@ union ubcore_reg_seg_flag {
 ```
 用户态 seg_cfg.is_gpu_seg = 1（urma_seg_cfg_t 新增普通字段）
     ↓
-udma_u_register_seg(): 跳过 ummu_grant()；把 is_gpu_seg 打进
-                        struct udma_register_seg_ucmd，塞进 udata.in_addr
+udma_u_register_seg(): 仍做 ummu_grant（MAPT token/perm）；把 is_gpu_seg
+                        打进 struct udma_register_seg_ucmd，塞进 udata.in_addr
+                        （厂商选择是 udma.ko gpu_vendor=，不是 ucmd）
     ↓ urma_cmd_register_seg() → ioctl
               (arg.udata = udrv_data，arg.in.flag 完全不受影响)
 uburma_cmd_register_seg(): fill_udata() 把 arg.udata 挂到 struct ubcore_udata
@@ -93,13 +94,13 @@ udma_ioummu_remote_map / udma_iommu_local_map
 | `urma/Makefile` | OOT：NVIDIA 走实验室旁路树；沐曦走 `/lib/modules/$(uname -r)/extra/{metax.ko.xz,Module.symvers}`，无独立 `metax_p2p.h` |
 | `Makefile`（根） | OOT 整树编译支持 |
 
-对应 UMDK 用户态需要改的地方（不在本仓库）：
+对应 UMDK 用户态需要改的地方（不在本仓库，见 123toorc/UMDK）：
 
 | 文件 | 改动 |
 |------|------|
-| `urma_types.h` | `urma_seg_cfg_t` 新增普通字段 `uint32_t is_gpu_seg;` |
-| `udma_u_segment.c` | 定义与内核一致的 `struct udma_register_seg_ucmd`；GPU 时跳过 `ummu_grant`/`ummu_ungrant`；把 `is_gpu_seg` 打进 `ucmd`，通过 `urma_cmd_udrv_priv_t` 传给 `urma_cmd_register_seg()` |
-| `perftest_resources.c` | GPU 变种设置 `seg_cfg.is_gpu_seg = 1` + 64KB 对齐 |
+| `urma_types.h` | `urma_seg_cfg_t` 已有 `uint32_t is_gpu_seg;`。**不要**往 ucmd `reserved` 里塞 vendor：内核用 `udma.ko gpu_vendor=` 选卡 |
+| `udma_u_segment.c` | `struct udma_register_seg_ucmd { is_gpu_seg, reserved }` 与内核一致；`is_gpu_seg` 走 `udrv_data`。MAPT `ummu_grant` 对 GPU 段仍要做（只跳过 grant 会丢 token/perm） |
+| perftest | NVIDIA：`--gpu-mode=peermem` + 64KB 对齐。沐曦：`--gpu-mode=metax`（`mcMalloc`）+ `PAGE_SIZE` 对齐；加载 `udma.ko gpu_vendor=metax` |
 
 ---
 

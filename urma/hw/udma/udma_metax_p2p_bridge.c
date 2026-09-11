@@ -78,22 +78,29 @@ static int udma_metax_build_phys_sgt(struct sg_table *src, struct sg_table *dst,
 				     uint64_t bus_offset)
 {
 	struct scatterlist *s, *d;
-	unsigned int i;
+	unsigned int i, nents;
 	int ret;
 
-	if (!src || !src->nents || !src->sgl)
+	/*
+	 * get_mem() may return an unmapped sgt (nents==0, orig_nents set)
+	 * or a dma_map_sg result (nents = mapped count). Prefer nents.
+	 */
+	if (!src || !src->sgl)
+		return -EINVAL;
+	nents = src->nents ? src->nents : src->orig_nents;
+	if (!nents)
 		return -EINVAL;
 
-	ret = sg_alloc_table(dst, src->nents, GFP_KERNEL);
+	ret = sg_alloc_table(dst, nents, GFP_KERNEL);
 	if (ret)
 		return ret;
 
 	d = dst->sgl;
-	for_each_sg(src->sgl, s, src->nents, i) {
+	for_each_sg(src->sgl, s, nents, i) {
 		dma_addr_t pa = udma_metax_sg_pa(s, bus_offset);
 		unsigned int len = udma_metax_sg_len(s);
 
-		if (!pa || !len) {
+		if (!d || !pa || !len) {
 			sg_free_table(dst);
 			return -EINVAL;
 		}
