@@ -29,11 +29,7 @@
 #include <linux/mm.h>
 
 #include "udma_gpu_p2p_ops.h"
-#ifdef HAVE_METAX_P2P_HEADER
-#include <metax_p2p.h>
-#else
 #include "udma_metax_p2p.h"
-#endif
 
 static bool apply_bus_offset;
 module_param(apply_bus_offset, bool, 0644);

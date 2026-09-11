@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 /*
- * Fallback MetaX P2P declarations used only when the vendor header is
- * not on the include path. The live header is:
- *   /usr/src/metax-1inux-3.8.23/interface/metax/metax_p2p.h
- * wired by METAX_P2P_HEADER_PATH in urma/Makefile.
+ * Local prototypes for MetaX P2P exports in metax.ko.
+ * Compile-time only. Link against the installed KMD:
+ *   /lib/modules/$(uname -r)/extra/metax.ko.xz
+ *   /lib/modules/$(uname -r)/extra/Module.symvers
  */
 
 #ifndef __UDMA_METAX_P2P_H__

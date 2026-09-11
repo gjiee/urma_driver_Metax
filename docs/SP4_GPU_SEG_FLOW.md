@@ -89,8 +89,8 @@ udma_ioummu_remote_map / udma_iommu_local_map
 | `urma/hw/udma/udma_segment.h` | GPU 段结构体扩展（`is_gpu_seg`、`struct udma_gpu_p2p_mem gpu`） |
 | `urma/hw/udma/udma_segment.c` | `udma_register_seg()` 入口处从 `udata` 解析 GPU 标记并打到本地 `cfg`；`udma_init_seg_cfg` / `udma_pin_pages_and_ioummu_map` / legacy 路径 / `udma_unpin_seg_pages` 分流不变 |
 | `urma/hw/udma/udma_main.c` | 无 `MODULE_SOFTDEP`——`udma.ko` 不依赖 nvidia/bridge 就能加载 |
-| `urma/hw/udma/Makefile` | 编译 `udma.ko`（含 `udma_gpu_p2p.o`）；有头文件时再编 `udma_nv_p2p_bridge.ko` / `udma_metax_p2p_bridge.ko` |
-| `urma/Makefile` | OOT：NVIDIA 走实验室旁路树；沐曦走 `/usr/src/metax-1inux-3.8.23/interface/metax/metax_p2p.h` |
+| `urma/hw/udma/Makefile` | 编译 `udma.ko`（含 `udma_gpu_p2p.o`）；NVIDIA 有 `nv-p2p.h` 再编 NV bridge；沐曦有 `extra/Module.symvers` 再编 MetaX bridge |
+| `urma/Makefile` | OOT：NVIDIA 走实验室旁路树；沐曦走 `/lib/modules/$(uname -r)/extra/{metax.ko.xz,Module.symvers}` |
 | `Makefile`（根） | OOT 整树编译支持 |
 
 对应 UMDK 用户态需要改的地方（不在本仓库）：
@@ -236,19 +236,17 @@ make NV_P2P_HEADER_PATH=/path/to/nv-p2p-header-dir \
 
 ```
 NVIDIA 头文件: ../nv_module_netlab/kernel-open/nvidia/nv-p2p.h
-沐曦模块:     /lib/modules/$(uname -r)/extra/metax.ko.xz  (modinfo: metax 3.8.23, GPL)
-沐曦头文件:   /usr/src/metax-1inux-3.8.23/interface/metax/metax_p2p.h
-沐曦符号表:   /usr/src/metax-1inux-3.8.23/Module.symvers
+沐曦 KMD 目录: /lib/modules/$(uname -r)/extra/
+               metax.ko.xz + Module.symvers
+沐曦 P2P 原型: urma/hw/udma/udma_metax_p2p.h（本仓库，不引用 /usr/src）
 ```
 
 ```bash
 cd urma
 make
 make show-vars
-# 沐曦树不在默认位置时：
-make METAX_SRC=/usr/src/metax-linux-<ver>
-# 或只改头文件目录：
-make METAX_P2P_HEADER_PATH=/path/to/interface/metax
+# extra/ 不在默认内核目录时：
+make METAX_KMOD_DIR=/lib/modules/$(uname -r)/extra
 ```
 
 加载顺序（三级，注意 `udma_nv_p2p_bridge.ko` 最后装）：
