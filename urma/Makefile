@@ -41,8 +41,6 @@ HAVE_NV_P2P_HEADER := $(if $(wildcard $(NV_P2P_HEADER_PATH)/nv-p2p.h),1,0)
 HAVE_NV_SYMVERS := $(if $(and $(filter 1,$(HAVE_NV_P2P_HEADER)),$(wildcard $(NV_MODULE_SYMVERS))),1,0)
 HAVE_METAX_KMOD := $(if $(wildcard $(METAX_KMOD)),1,0)
 HAVE_METAX_SYMVERS := $(if $(wildcard $(METAX_MODULE_SYMVERS)),1,0)
-HAVE_UMMU_MATT_PHYS_SG := $(if $(shell grep -rsq --include='*.h' ummu_sva_matt_map_phys_sg \
-	$(KDIR)/include $(KDIR)/usr/include 2>/dev/null && echo y),1,0)
 
 check-gpu-deps:
 ifeq ($(HAVE_NV_P2P_HEADER),0)
@@ -89,7 +87,6 @@ modules: check-gpu-deps
 		NV_P2P_HEADER_PATH=$(NV_P2P_HEADER_PATH) \
 		NV_MODULE_SYMVERS=$(if $(filter 1,$(HAVE_NV_SYMVERS)),$(abspath $(NV_MODULE_SYMVERS)),) \
 		METAX_MODULE_SYMVERS=$(if $(filter 1,$(HAVE_METAX_SYMVERS)),$(abspath $(METAX_MODULE_SYMVERS)),) \
-		UDMA_HAVE_UMMU_MATT_PHYS_SG=$(HAVE_UMMU_MATT_PHYS_SG) \
 		UBASE_MODULE_SYMVERS=$(abspath $(UBASE_MODULE_SYMVERS)) \
 		KBUILD_EXTRA_SYMBOLS="$(EXTRA_KBUILD_SYMVERS)" \
 		modules
@@ -107,7 +104,6 @@ show-vars:
 	@echo METAX_MODULE_SYMVERS=$(METAX_MODULE_SYMVERS)
 	@echo HAVE_METAX_KMOD=$(HAVE_METAX_KMOD)
 	@echo HAVE_METAX_SYMVERS=$(HAVE_METAX_SYMVERS)
-	@echo HAVE_UMMU_MATT_PHYS_SG=$(HAVE_UMMU_MATT_PHYS_SG)
 	@echo UBASE_MODULE_SYMVERS=$(UBASE_MODULE_SYMVERS)
 
 clean:

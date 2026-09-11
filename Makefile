@@ -18,8 +18,6 @@ METAX_MODULE_SYMVERS ?= $(METAX_KMOD_DIR)/Module.symvers
 HAVE_NV_P2P_HEADER := $(if $(wildcard $(NV_P2P_HEADER_PATH)/nv-p2p.h),1,0)
 HAVE_NV_SYMVERS := $(if $(and $(filter 1,$(HAVE_NV_P2P_HEADER)),$(wildcard $(NV_MODULE_SYMVERS))),1,0)
 HAVE_METAX_SYMVERS := $(if $(wildcard $(METAX_MODULE_SYMVERS)),1,0)
-HAVE_UMMU_MATT_PHYS_SG := $(if $(shell grep -rsq --include='*.h' ummu_sva_matt_map_phys_sg \
-	$(KDIR)/include $(KDIR)/usr/include 2>/dev/null && echo y),1,0)
 
 EXTRA_KBUILD_SYMVERS := $(if $(filter 1,$(HAVE_NV_SYMVERS)),$(abspath $(NV_MODULE_SYMVERS)),) \
 	$(if $(filter 1,$(HAVE_METAX_SYMVERS)),$(abspath $(METAX_MODULE_SYMVERS)),)
@@ -31,7 +29,6 @@ all:
                 CONFIG_UB=m CONFIG_UB_UBASE=m CONFIG_UB_URMA=m CONFIG_UB_UDMA=m \
                 NV_P2P_HEADER_PATH=$(if $(filter 1,$(HAVE_NV_P2P_HEADER)),$(NV_P2P_HEADER_PATH),) \
                 METAX_MODULE_SYMVERS=$(if $(filter 1,$(HAVE_METAX_SYMVERS)),$(abspath $(METAX_MODULE_SYMVERS)),) \
-                UDMA_HAVE_UMMU_MATT_PHYS_SG=$(HAVE_UMMU_MATT_PHYS_SG) \
                 KBUILD_EXTRA_SYMBOLS="$(EXTRA_KBUILD_SYMVERS)" \
                 modules
 
@@ -45,7 +42,6 @@ show-vars:
 	@echo METAX_KMOD=$(METAX_KMOD)
 	@echo METAX_MODULE_SYMVERS=$(METAX_MODULE_SYMVERS)
 	@echo HAVE_METAX_SYMVERS=$(HAVE_METAX_SYMVERS)
-	@echo HAVE_UMMU_MATT_PHYS_SG=$(HAVE_UMMU_MATT_PHYS_SG)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean

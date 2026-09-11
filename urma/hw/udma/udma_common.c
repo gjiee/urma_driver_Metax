@@ -261,12 +261,8 @@ void udma_ioummu_unmap(uint32_t l_tid, uint32_t r_tid, uint64_t addr, size_t siz
 }
 
 #ifdef CONFIG_UMMU_MATT_PHYS_SG
-/*
- * GPU segments carry a phys SG (sg_page=NULL, dma_addr=PA).
- * Patched UMMU exposes ummu_sva_matt_map_phys_sg; stock SP4 only
- * has ummu_sva_matt_map. Use the dedicated API when the kernel
- * header has it (UDMA_HAVE_UMMU_MATT_PHYS_SG), otherwise fall back.
- */
+// TONG @ HKSAR
+// ADD for GDR
 int udma_ioummu_map_phys_sg(uint32_t l_tid, uint32_t r_tid,
 			    int prot, uint64_t addr,
 			    struct sg_table *sgt,
@@ -288,11 +284,7 @@ int udma_ioummu_map_phys_sg(uint32_t l_tid, uint32_t r_tid,
 		(uint64_t)sg_dma_address(sgt->sgl),
 		sgt->nents);
 
-#ifdef UDMA_HAVE_UMMU_MATT_PHYS_SG
 	return ummu_sva_matt_map_phys_sg(&domain, addr, sgt, prot);
-#else
-	return ummu_sva_matt_map(&domain, addr, sgt, prot);
-#endif
 }
 
 int udma_ioummu_unmap_phys_sg(uint32_t l_tid, uint32_t r_tid,
@@ -314,13 +306,9 @@ int udma_ioummu_unmap_phys_sg(uint32_t l_tid, uint32_t r_tid,
 		l_tid, r_tid, mm, current->mm,
 		addr, size);
 
-#ifdef UDMA_HAVE_UMMU_MATT_PHYS_SG
 	return ummu_sva_matt_unmap_phys_sg(&domain, addr, size);
-#else
-	ummu_sva_matt_unmap(&domain, addr, size);
-	return 0;
-#endif
 }
+
 #endif
 
 int udma_id_alloc_auto_grow(struct udma_dev *udma_dev, struct udma_ida *ida_table,
