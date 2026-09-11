@@ -236,6 +236,7 @@ make NV_P2P_HEADER_PATH=/path/to/nv-p2p-header-dir \
 
 ```
 NVIDIA 头文件: ../nv_module_netlab/kernel-open/nvidia/nv-p2p.h
+沐曦模块:     /lib/modules/$(uname -r)/extra/metax.ko.xz  (modinfo: metax 3.8.23, GPL)
 沐曦头文件:   /usr/src/metax-1inux-3.8.23/interface/metax/metax_p2p.h
 沐曦符号表:   /usr/src/metax-1inux-3.8.23/Module.symvers
 ```
