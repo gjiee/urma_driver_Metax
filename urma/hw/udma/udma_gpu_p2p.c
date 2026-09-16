@@ -1,45 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0+
 /* Copyright(c) 2025 HiSilicon Technologies CO., Ltd. All rights reserved. */
 /*
- * GPU兼容测试补丁 — SP4 (openEuler-24.03-LTS-SP4 同步版)
+ * GPU pin/unpin inside udma.ko — vendor-neutral.
  *
- * 环节 5: GPU Pin + SG 构建（Scheme A，闭源 nvidia.ko 兼容版，v2）
+ * Host segments keep using pin_user_pages. GPU segments:
  *
- * 改动记录:
- *   - nvidia_p2p_get_pages_persistent / put_pages_persistent /
- *     nvidia_p2p_build_sg_table_phys 在闭源驱动上都 "Unknown symbol ...
- *     (err -2)"，换成经典 nvidia_p2p_get_pages/put_pages/free_page_table
- *     依然 "Unknown symbol"——根因是 udma.ko 纯 GPL、nvidia.ko
- *     proprietary，跨边界静态符号解析不干净。
- *   - v1 修复（已废弃）: 切一个 Dual BSD/GPL 的 udma_nv_p2p_bridge.ko
- *     直接链 nvidia.ko，udma.ko 改成静态链接这个桥接模块的 wrapper 符号。
- *     结果 udma_nv_p2p_bridge.ko 因为链了 nvidia.ko，被内核
- *     inherit_taint() 无条件打上 TAINT_PROPRIETARY_MODULE（跟它自己
- *     声明什么 license 无关），udma.ko 再去链**它**，撞上一模一样的
- *     "Unknown symbol"墙，只是模块名换成了 udma_nv_p2p_bridge。
- *     本质没解决——只是把"谁是 proprietary"这层皮往后挪一层。
- *   - v2 修复（当前采用）: 彻底反转控制方向，udma.ko **不 import 任何
- *     bridge 导出符号**。udma.ko 自己导出两个普通 GPL 符号
- *     udma_register_gpu_p2p_ops()/udma_unregister_gpu_p2p_ops()
- *     （本文件实现），udma_nv_p2p_bridge.ko 在自己 module_init() 里
- *     主动调用它们，把一组函数指针"注册"进来。udma.ko 后续调 NV P2P
- *     一律走函数指针（g_gpu_p2p_ops->get_pages(...)），不做任何静态
- *     符号解析——内核模块加载器层面根本没有 "resolve_symbol" 这一步，
- *     自然没有 taint 传播/GPL 校验/CRC 校验的问题。这正是 Mellanox
- *     ib_core.ko 与 nvidia-peermem.ko 之间的真实关系
- *     （ib_register_peer_memory_client 模式），不是我们发明的。
- *   - nvidia_p2p_build_sg_table_phys 根本不是官方符号（本项目自造），
- *     改成本文件内 udma_gpu_build_sg_table() 本地实现，只用官方公开
- *     稳定字段 page_table->pages[i]->physical_address（纯结构体字段
- *     读取，不涉及符号链接）。
+ *   ioctl REGISTER_SEG (is_gpu_seg via udrv_data)
+ *     → udma_register_seg()
+ *     → udma_gpu_pin_seg_pages()
+ *          ops->pin(va, len, invalidate, seg, &pin)
+ *          take pin.sgt (phys SG, sg_page=NULL)
+ *     → ummu_sva_matt_map_phys_sg(gpu_va, sgt)
  *
- * 加载顺序: nvidia.ko -> udma.ko -> udma_nv_p2p_bridge.ko
- * （bridge 必须最后装，因为它 init 时要反过来调 udma.ko 的导出符号）
+ * Vendor bridges (loaded last) register ops:
+ *   MetaX  : acquire_mem → get_mem → clone to phys SG
+ *   NVIDIA : get_pages   → build phys SG from BAR PAs
  *
- * 当前阶段已知简化（TODO）:
- *   free_callback 只做最小处理（打日志 + free_page_table），不做完整的
- *   向上层通知失效；只要测试流程严格 "register → 用 → unregister"，
- *   不提前 cudaFree，这条路径不会被触发。
+ * udma.ko does not include nv-p2p.h or metax headers.
  */
 
 #define dev_fmt(fmt) "UDMA: " fmt
@@ -48,63 +25,118 @@
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/scatterlist.h>
+#include <linux/string.h>
+#include <linux/err.h>
+#include <linux/device.h>
+#include <linux/mm.h>
 
 #include "udma_gpu_p2p.h"
-#include "udma_nv_p2p_bridge.h"
+#include "udma_gpu_p2p_ops.h"
 
-/*
- * FIX: nv-p2p.h 挪到这里、且套上 #if UDMA_GPU_P2P_ENABLE —— 必须先
- * include udma_gpu_p2p.h 才知道这个宏的值（可能被 Makefile 用
- * -DUDMA_GPU_P2P_ENABLE=0 覆盖）。udma_nv_p2p_bridge.h 里
- * struct nvidia_p2p_page_table 只是前置声明（forward decl），不需要
- * nv-p2p.h 才能编译，所以上面那行不受影响，可以放在条件编译之外。
- *
- * 只有 udma_gpu_build_sg_table()/udma_gpu_pin_seg_pages() 这两个函数
- * 真的会解引用 struct nvidia_p2p_page_table 的字段（entries/page_size/
- * pages[i]->physical_address），需要完整类型定义；其余函数（注册/
- * 反注册 ops、get/put provider 引用计数、free_callback、unpin）全程
- * 只是传递/调用函数指针，对 nvidia_p2p_page_table 始终是"不透明指针"，
- * 从不需要完整类型 —— 所以没有 NVIDIA 头文件的机器（比如对端没有 GPU
- * 的 node1）也能编译出功能完整的 udma.ko，只是 GPU pin 这条路径在
- * UDMA_GPU_P2P_ENABLE=0 时走 udma_gpu_p2p.h 里的 static inline stub
- * (返回 -ENOTSUPP)，不影响其它任何 HOST 段功能。
- */
-#if UDMA_GPU_P2P_ENABLE
-/*
- * 仅用于 struct nvidia_p2p_page_table/nvidia_p2p_page 的字段布局和
- * NVIDIA_P2P_PAGE_SIZE_64KB 常量 —— 纯编译期类型信息，不产生任何符号
- * 链接依赖（本文件不直接调用任何 nvidia_p2p_* 函数）。
- */
-#include <nv-p2p.h>
-#endif
+#define UDMA_GPU_SEL_AUTO	(-1)
+#define UDMA_GPU_SEL_NONE	(-2)
 
-/*
- * GPU兼容测试补丁: 当前注册的 GPU P2P provider（唯一，桥接模块 init
- * 时注册，exit 时反注册）。加锁保护并发 register/unregister 和
- * pin/unpin 之间的竞争；调用前 try_module_get(owner) 防止调用期间
- * provider 模块被 rmmod。
- */
-static const struct udma_gpu_p2p_ops *g_gpu_p2p_ops;
+static const struct udma_gpu_p2p_ops *g_gpu_p2p_ops[UDMA_GPU_VENDOR_MAX];
 static DEFINE_MUTEX(g_gpu_p2p_ops_lock);
+
+/*
+ * Runtime switch: which GPU card URMA GPU-seg registration uses.
+ *
+ *   auto   — exactly one registered provider (default)
+ *   metax  — 沐曦
+ *   nvidia — NVIDIA (alias: nv)
+ *   none   — disable GPU pin
+ *
+ * Both bridges may be loaded. pin() follows this param; unpin() uses
+ * the vendor recorded on the segment.
+ *
+ *   insmod udma.ko gpu_vendor=metax
+ *   echo nvidia > /sys/module/udma/parameters/gpu_vendor
+ */
+static char gpu_vendor[16] = "auto";
+
+static int udma_gpu_parse_sel(const char *s)
+{
+	if (!s || !s[0] || !strcasecmp(s, "auto"))
+		return UDMA_GPU_SEL_AUTO;
+	if (!strcasecmp(s, "none") || !strcasecmp(s, "off"))
+		return UDMA_GPU_SEL_NONE;
+	if (!strcasecmp(s, "metax"))
+		return UDMA_GPU_VENDOR_METAX;
+	if (!strcasecmp(s, "nvidia") || !strcasecmp(s, "nv"))
+		return UDMA_GPU_VENDOR_NVIDIA;
+	return -EINVAL;
+}
+
+static const char *udma_gpu_vendor_name(int vendor)
+{
+	switch (vendor) {
+	case UDMA_GPU_VENDOR_METAX:
+		return "metax";
+	case UDMA_GPU_VENDOR_NVIDIA:
+		return "nvidia";
+	case UDMA_GPU_SEL_NONE:
+		return "none";
+	case UDMA_GPU_SEL_AUTO:
+		return "auto";
+	default:
+		return "?";
+	}
+}
+
+static int gpu_vendor_set(const char *val, const struct kernel_param *kp)
+{
+	char buf[16];
+	int sel;
+
+	if (strscpy(buf, val, sizeof(buf)) < 0)
+		return -EINVAL;
+	strim(buf);
+	sel = udma_gpu_parse_sel(buf);
+	if (sel == -EINVAL) {
+		pr_err("UDMA: invalid gpu_vendor='%s' (use auto|metax|nvidia|none)\n",
+		       buf);
+		return -EINVAL;
+	}
+	strscpy(gpu_vendor, udma_gpu_vendor_name(sel), sizeof(gpu_vendor));
+	pr_info("UDMA: gpu_vendor=%s\n", gpu_vendor);
+	return 0;
+}
+
+static int gpu_vendor_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%s\n", gpu_vendor);
+}
+
+static const struct kernel_param_ops gpu_vendor_ops = {
+	.set = gpu_vendor_set,
+	.get = gpu_vendor_get,
+};
+
+module_param_cb(gpu_vendor, &gpu_vendor_ops, NULL, 0644);
+MODULE_PARM_DESC(gpu_vendor,
+		 "GPU card for URMA GPU segments: auto, metax, nvidia, none");
 
 int udma_register_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops)
 {
 	int ret = 0;
 
-	if (!ops || !ops->get_pages || !ops->put_pages || !ops->free_page_table)
+	if (!ops || !ops->pin || !ops->unpin ||
+	    ops->vendor >= UDMA_GPU_VENDOR_MAX)
 		return -EINVAL;
 
 	mutex_lock(&g_gpu_p2p_ops_lock);
-	if (g_gpu_p2p_ops) {
-		pr_err("UDMA: GPU P2P ops already registered by %s, reject %s\n",
-		       g_gpu_p2p_ops->owner ? g_gpu_p2p_ops->owner->name : "?",
-		       ops->owner ? ops->owner->name : "?");
+	if (g_gpu_p2p_ops[ops->vendor]) {
+		pr_err("UDMA: GPU P2P %s already registered, reject %s\n",
+		       udma_gpu_vendor_name(ops->vendor),
+		       ops->name ? ops->name : "?");
 		ret = -EBUSY;
 		goto out;
 	}
-	g_gpu_p2p_ops = ops;
-	pr_info("UDMA: GPU P2P ops registered by %s\n",
-		ops->owner ? ops->owner->name : "?");
+	g_gpu_p2p_ops[ops->vendor] = ops;
+	pr_info("UDMA: GPU P2P ops registered by %s (gpu_vendor=%s)\n",
+		ops->name ? ops->name : udma_gpu_vendor_name(ops->vendor),
+		gpu_vendor);
 out:
 	mutex_unlock(&g_gpu_p2p_ops_lock);
 	return ret;
@@ -113,45 +145,102 @@ EXPORT_SYMBOL(udma_register_gpu_p2p_ops);
 
 void udma_unregister_gpu_p2p_ops(const struct udma_gpu_p2p_ops *ops)
 {
+	if (!ops || ops->vendor >= UDMA_GPU_VENDOR_MAX)
+		return;
+
 	mutex_lock(&g_gpu_p2p_ops_lock);
-	if (g_gpu_p2p_ops != ops) {
-		pr_warn("UDMA: udma_unregister_gpu_p2p_ops: ops pointer mismatch, ignoring\n");
+	if (g_gpu_p2p_ops[ops->vendor] != ops) {
+		pr_warn("UDMA: udma_unregister_gpu_p2p_ops: %s mismatch, ignoring\n",
+			ops->name ? ops->name : "?");
 		goto out;
 	}
-	g_gpu_p2p_ops = NULL;
-	pr_info("UDMA: GPU P2P ops unregistered\n");
+	g_gpu_p2p_ops[ops->vendor] = NULL;
+	pr_info("UDMA: GPU P2P ops unregistered (%s)\n",
+		udma_gpu_vendor_name(ops->vendor));
 out:
 	mutex_unlock(&g_gpu_p2p_ops_lock);
 }
 EXPORT_SYMBOL(udma_unregister_gpu_p2p_ops);
 
-/*
- * FIX: 从这里到文件末尾，全部套 #if UDMA_GPU_P2P_ENABLE —— 这些函数
- * 要么直接 #include <nv-p2p.h> 才能解引用的字段（build_sg_table/
- * pin_seg_pages），要么只被这两个函数调用（align_len/free_callback/
- * ops_get/ops_put，禁用状态下没有别的调用方，留着不 gate 会变成
- * unused-function 警告，-Werror 环境下会直接编译失败）。禁用时
- * udma_gpu_pin_seg_pages()/udma_gpu_unpin_seg_pages() 使用
- * udma_gpu_p2p.h 里的 static inline stub（返回 -ENOTSUPP / no-op），
- * 所以这里不需要（也不能，会跟 static inline 重定义冲突）再定义同名
- * 函数。
- */
-#if UDMA_GPU_P2P_ENABLE
+static const struct udma_gpu_p2p_ops *
+udma_gpu_p2p_try_get_slot(enum udma_gpu_vendor vendor)
+{
+	const struct udma_gpu_p2p_ops *ops;
 
-/*
- * GPU兼容测试补丁: 取当前 provider 并 try_module_get 固定住，防止拿到
- * 指针之后 provider 被 rmmod。用完必须配对调用 udma_gpu_p2p_ops_put()。
- * 返回 NULL 表示当前没有 provider 注册（bridge 模块没装/装晚了）。
- */
-static const struct udma_gpu_p2p_ops *udma_gpu_p2p_ops_get(void)
+	if (vendor >= UDMA_GPU_VENDOR_MAX)
+		return NULL;
+	ops = g_gpu_p2p_ops[vendor];
+	if (ops && !try_module_get(ops->owner))
+		return NULL;
+	return ops;
+}
+
+static const struct udma_gpu_p2p_ops *
+udma_gpu_p2p_ops_get_slot(enum udma_gpu_vendor vendor)
 {
 	const struct udma_gpu_p2p_ops *ops;
 
 	mutex_lock(&g_gpu_p2p_ops_lock);
-	ops = g_gpu_p2p_ops;
-	if (ops && !try_module_get(ops->owner))
-		ops = NULL;
+	ops = udma_gpu_p2p_try_get_slot(vendor);
 	mutex_unlock(&g_gpu_p2p_ops_lock);
+	return ops;
+}
+
+static const struct udma_gpu_p2p_ops *
+udma_gpu_p2p_ops_get_selected(struct device *dev)
+{
+	const struct udma_gpu_p2p_ops *ops = NULL;
+	int sel, i, found = -1, n = 0;
+
+	sel = udma_gpu_parse_sel(gpu_vendor);
+	if (sel == -EINVAL) {
+		dev_err(dev, "invalid gpu_vendor=%s (use auto|metax|nvidia|none)\n",
+			gpu_vendor);
+		return ERR_PTR(-EINVAL);
+	}
+	if (sel == UDMA_GPU_SEL_NONE) {
+		dev_err(dev, "GPU pin disabled (gpu_vendor=none)\n");
+		return ERR_PTR(-ENODEV);
+	}
+
+	mutex_lock(&g_gpu_p2p_ops_lock);
+	if (sel >= 0) {
+		ops = udma_gpu_p2p_try_get_slot(sel);
+		mutex_unlock(&g_gpu_p2p_ops_lock);
+		if (!ops) {
+			dev_err(dev,
+				"gpu_vendor=%s but %s provider is not registered "
+				"(load the matching udma_*_p2p_bridge.ko)\n",
+				gpu_vendor, udma_gpu_vendor_name(sel));
+			return ERR_PTR(-ENODEV);
+		}
+		return ops;
+	}
+
+	for (i = 0; i < UDMA_GPU_VENDOR_MAX; i++) {
+		if (g_gpu_p2p_ops[i]) {
+			n++;
+			found = i;
+		}
+	}
+	if (n == 1)
+		ops = udma_gpu_p2p_try_get_slot(found);
+	mutex_unlock(&g_gpu_p2p_ops_lock);
+
+	if (n == 0) {
+		dev_err(dev, "GPU P2P provider not registered "
+			"(load udma_metax_p2p_bridge.ko or udma_nv_p2p_bridge.ko, "
+			"then set gpu_vendor=metax|nvidia if both are loaded)\n");
+		return ERR_PTR(-ENODEV);
+	}
+	if (n > 1) {
+		dev_err(dev,
+			"both metax and nvidia GPU providers are registered; "
+			"set gpu_vendor=metax or gpu_vendor=nvidia\n");
+		return ERR_PTR(-EINVAL);
+	}
+	if (!ops)
+		return ERR_PTR(-ENODEV);
 	return ops;
 }
 
@@ -162,129 +251,40 @@ static void udma_gpu_p2p_ops_put(const struct udma_gpu_p2p_ops *ops)
 }
 
 /*
- * GPU兼容测试补丁: 将用户 [va, va+len) 映射长度对齐到 64KB 边界
- * @addr: cfg->va（可非对齐，函数内部会 mask）
- * @len:  cfg->len
- * 返回: 从 (addr & MASK) 到向上对齐 end 的字节数
- */
-static uint64_t udma_gpu_align_len(uint64_t addr, uint64_t len)
-{
-	uint64_t end;
-
-	end = (addr + len + UDMA_GPU_P2P_PAGE_SIZE - 1) & UDMA_GPU_P2P_PAGE_MASK;
-	return end - (addr & UDMA_GPU_P2P_PAGE_MASK);
-}
-
-/*
- * GPU兼容测试补丁: 本地拼 sg_table，替代不存在的 nvidia_p2p_build_sg_table_phys
- * @page_table: provider get_pages() 返回值，entries/pages[]/page_size 都是
- *              官方 nv-p2p.h 公开字段。
- * @sgt:        输出，sg_page=NULL（无 struct page，纯 PA），
- *              sg_dma_address=GPU 物理地址，sg_dma_len=64KB（与 NV P2P 页一致）。
+ * Vendor is dropping the GPU buffer (cudaFree / MetaX recycle) while
+ * the URMA segment is still registered.
  *
- * 不再把 64KB NV 页切成 4KB SG。V100 不共页表路径上 iommu_map 会按
- * pgsize_bitmap 自己拆叶；小消息卡住是 GDR last-byte 可见性，不是 SG 粒度。
- */
-static int udma_gpu_build_sg_table(struct nvidia_p2p_page_table *page_table,
-				   struct sg_table *sgt)
-{
-	struct scatterlist *sg;
-	uint64_t page_size = UDMA_GPU_P2P_PAGE_SIZE;
-	uint32_t i;
-	int ret;
-
-	if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB)
-		return -EINVAL;
-
-	ret = sg_alloc_table(sgt, page_table->entries, GFP_KERNEL);
-	if (ret)
-		return ret;
-
-	for_each_sg(sgt->sgl, sg, page_table->entries, i) {
-		sg_set_page(sg, NULL, page_size, 0);
-		sg_dma_address(sg) = page_table->pages[i]->physical_address;
-		sg_dma_len(sg) = page_size;
-	}
-
-	return 0;
-}
-
-/*
- * GPU兼容测试补丁: nvidia_p2p_get_pages() 的 free_callback
- * （经当前注册的 provider 转发，函数指针调用，不涉及符号链接）
+ * MetaX recycle frees the vendor handle after this returns, so the
+ * handle pointer is cleared here. NVIDIA keeps a local wrapper that
+ * unpin() still frees.
  *
- * 触发时机: GPU 内存在本段还没 unregister_seg 之前被 App 提前释放
- * （例如 cudaFree 早于 urma_unregister_seg）。NV 驱动会异步调用这里，
- * 调用之后 page_table 本身已经不可信，不能再对它做 put_pages()。
- *
- * TODO（当前测试补丁的已知简化）:
- *   正确做法应该顺着 seg → ubcore_target_seg 往上通知 ubcore/上层这段已经
- *   失效（类似 nvidia-peermem 的 invalidate_peer_memory 回调），让后续
- *   WRITE/READ 直接报错而不是访问已释放的物理页。这里先只打印错误日志，
- *   把 force_freed 置位防止 unpin 时重复 put_pages，其余先不处理——
- *   只要测试流程严格 "register → 用 → unregister"，不提前 cudaFree，
- *   这个回调就不会被触发，不影响先跑通 pin/unpin 主链路。
+ * TODO: propagate invalidation to ubcore so later WRITE/READ fail
+ * instead of touching stale PAs. Test path is register → use →
+ * unregister without early free.
  */
-static void udma_gpu_p2p_free_callback(void *data)
+static int udma_gpu_invalidate(void *arg)
 {
-	struct udma_segment *seg = (struct udma_segment *)data;
-	const struct udma_gpu_p2p_ops *ops;
+	struct udma_segment *seg = arg;
 
 	if (!seg) {
-		pr_err("UDMA: GPU free_callback with NULL seg\n");
-		return;
+		pr_err("UDMA: GPU invalidate with NULL seg\n");
+		return -EINVAL;
 	}
 
-	pr_err("UDMA: GPU seg gpu_va=0x%llx force-freed by NVIDIA driver "
+	pr_err("UDMA: GPU seg gpu_va=0x%llx force-freed by vendor "
 	       "(App freed GPU memory before unregister_seg) — segment now stale, "
 	       "TODO: propagate invalidation to ubcore\n",
 	       seg->gpu.gpu_va);
 
-	seg->gpu.force_freed = true;
-
-	/*
-	 * 回调上下文里不能再调 put_pages()（page_table 已经在 NV 内部被
-	 * 清理，语义上等价于 nvidia-peermem.c 的 nv_get_p2p_free_callback
-	 * 场景）。free_page_table 官方文档标注是 no-op，留着调用是为了跟
-	 * 第三方生态的既有习惯保持一致。
-	 */
-	ops = udma_gpu_p2p_ops_get();
-	if (!ops) {
-		pr_err("UDMA: GPU free_callback but no provider registered "
-		       "(bridge module unloaded?) — skip free_page_table\n");
-		return;
-	}
-	ops->free_page_table(seg->gpu.page_table);
-	udma_gpu_p2p_ops_put(ops);
+	WRITE_ONCE(seg->gpu.force_freed, true);
+	return 0;
 }
 
-/*
- * GPU兼容测试补丁 — 环节 5 主函数
- *
- * 调用链:
- *   udma_register_seg / udma_pin_pages_and_ioummu_map
- *     → udma_gpu_pin_seg_pages()
- *       → g_gpu_p2p_ops->get_pages(gpu_va, mapped_size, &page_table,
- *                                  udma_gpu_p2p_free_callback, seg)
- *         [udma_nv_p2p_bridge.ko 注册的回调，内部转发到 nvidia_p2p_get_pages;
- *          函数指针调用，udma.ko 不 import 任何 bridge/nvidia 符号]
- *       → udma_gpu_build_sg_table(page_table, &seg->umem->append.sgt)
- *
- * 参数说明:
- *   cfg->va:          用户传入的 CUDA GPU 虚拟地址
- *   cfg->len:         用户段长度
- *   cfg->token_id:    必填，否则 -EINVAL
- *   page_table:       NV 填充，每 entry 含 physical_address（GPU 显存 PA）
- *   seg->umem->append.sgt:
- *                     sg_page=NULL, sg_dma_address=PA, sg_dma_len=64KB
- */
 int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 			   struct ubcore_seg_cfg *cfg)
 {
 	const struct udma_gpu_p2p_ops *ops;
-	struct nvidia_p2p_page_table *page_table = NULL;
-	uint64_t gpu_va;
-	uint64_t mapped_size;
+	struct udma_gpu_p2p_pin pin = { 0 };
 	int ret;
 
 	if (!udma_seg_cfg_is_gpu(cfg))
@@ -295,149 +295,85 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 		return -EINVAL;
 	}
 
-	/* GPU兼容测试补丁: gpu_va 向下对齐 64KB，作为 NV pin 起始地址 */
-	gpu_va = cfg->va & UDMA_GPU_P2P_PAGE_MASK;
-	mapped_size = udma_gpu_align_len(cfg->va, cfg->len);
-	if (mapped_size == 0) {
-		dev_err(dev->dev, "invalid GPU seg len, va=0x%llx len=%d\n",
-			cfg->va, cfg->len);
-		return -EINVAL;
-	}
+	ops = udma_gpu_p2p_ops_get_selected(dev->dev);
+	if (IS_ERR(ops))
+		return PTR_ERR(ops);
 
-	ops = udma_gpu_p2p_ops_get();
-	if (!ops) {
-		dev_err(dev->dev, "GPU P2P provider not registered "
-			"(is udma_nv_p2p_bridge.ko loaded?)\n");
-		return -ENODEV;
-	}
-
-	/*
-	 * GPU兼容测试补丁: 函数指针调用，走已注册的 provider（通常是
-	 * udma_nv_p2p_bridge.ko），udma.ko 本身不 import 任何 nvidia_p2p_*
-	 * 或 bridge 导出符号。
-	 * free_callback: udma_gpu_p2p_free_callback，data 传 seg 本身
-	 *                方便回调里定位 gpu.page_table/gpu_va
-	 */
-	ret = ops->get_pages(gpu_va, mapped_size, &page_table,
-			     udma_gpu_p2p_free_callback, seg);
+	ret = ops->pin(cfg->va, cfg->len, udma_gpu_invalidate, seg, &pin);
 	if (ret) {
 		dev_err(dev->dev,
-			"WTF? GPU P2P get_pages failed gpu_va=0x%llx len=0x%llx ret=%d\n",
-			gpu_va, mapped_size, ret);
+			"GPU P2P pin failed va=0x%llx len=0x%llx provider=%s ret=%d\n",
+			cfg->va, cfg->len, ops->name ? ops->name : "?", ret);
 		udma_gpu_p2p_ops_put(ops);
 		return ret;
 	}
 
-	if (!page_table->entries || page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB) {
-		dev_err(dev->dev, "unsupported GPU page_table entries=%u page_size=%u\n",
-			page_table->entries, page_table->page_size);
-		ret = -EINVAL;
-		goto err_put_pages;
+	if (!pin.mapped_size || !pin.sgt.nents || !pin.sgt.sgl) {
+		dev_err(dev->dev, "GPU P2P pin returned empty range/sgt\n");
+		if (pin.sgt.sgl)
+			sg_free_table(&pin.sgt);
+		ops->unpin(pin.handle, pin.gpu_va, false);
+		udma_gpu_p2p_ops_put(ops);
+		return -EINVAL;
 	}
 
 	seg->umem = kzalloc(sizeof(*seg->umem), GFP_KERNEL);
 	if (!seg->umem) {
-		ret = -ENOMEM;
-		goto err_put_pages;
+		sg_free_table(&pin.sgt);
+		ops->unpin(pin.handle, pin.gpu_va, false);
+		udma_gpu_p2p_ops_put(ops);
+		return -ENOMEM;
 	}
 
 	seg->umem->ub_dev = &dev->ub_dev;
 	seg->umem->va = cfg->va;
 	seg->umem->length = cfg->len;
+	seg->umem->append.sgt = pin.sgt;
 
-	/*
-	 * GPU兼容测试补丁: 本地拼 sg_table（不再依赖 NV 侧任何自造符号）
-	 * 每个 sg: dma_address = GPU 物理地址（非 CPU PFN）
-	 * 供 ummu_sva_matt_map(domain, gpu_va, sgt, prot) 消费
-	 */
-	ret = udma_gpu_build_sg_table(page_table, &seg->umem->append.sgt);
-	if (ret) {
-		dev_err(dev->dev, "udma_gpu_build_sg_table failed ret=%d\n", ret);
-		goto err_free_umem;
-	}
-
-	dev_info(dev->dev,
-		 "[GPU-TRACE] NV pin + SG build OK: gpu_va=0x%llx mapped_size=0x%llx "
-		 "nv_entries=%u sg_nents=%u sg_len=0x%x first_pa=0x%llx\n",
-		 gpu_va, mapped_size, page_table->entries,
-		 seg->umem->append.sgt.nents,
-		 sg_dma_len(seg->umem->append.sgt.sgl),
-		 (uint64_t)sg_dma_address(seg->umem->append.sgt.sgl));
-
-	/*
-	 * GPU兼容测试补丁 — 一次性流程验证开关。
-	 * 改成 1：NV pin + 本地 SG 构建成功后立刻打印上面那行，然后主动报错
-	 * 结束流程（不再往下走 seg->is_gpu_seg=true / UMMU matt_map），方便
-	 * 先单独验证"内核识别 GPU VA → 调 NV → 建 SG 表"这一段能不能跑通，
-	 * 不受后面 UMMU 建表是否成功影响。验证完改回 0（或删掉这块 #if）
-	 * 即可恢复正常注册流程。
-	 */
-#define UDMA_GPU_P2P_TEST_STOP_AFTER_SG 0  
-#if UDMA_GPU_P2P_TEST_STOP_AFTER_SG
-	dev_err(dev->dev,
-		"[GPU-TRACE] TEST STOP: UDMA_GPU_P2P_TEST_STOP_AFTER_SG=1, "
-		"aborting before UMMU map on purpose (set macro to 0 to continue)\n");
-	ret = -ECANCELED;
-	goto err_free_sgt;
-#endif
-
-	seg->gpu.page_table = page_table;
-	seg->gpu.gpu_va = gpu_va;
-	seg->gpu.mapped_size = mapped_size;
+	seg->gpu.handle = pin.handle;
+	seg->gpu.vendor = ops->vendor;
+	seg->gpu.gpu_va = pin.gpu_va;
+	seg->gpu.mapped_size = pin.mapped_size;
+	seg->gpu.page_size = pin.page_size;
+	seg->gpu.bus_offset = pin.bus_offset;
 	seg->gpu.force_freed = false;
-	seg->addr = gpu_va;
-	seg->length = mapped_size;
+	seg->addr = pin.gpu_va;
+	seg->length = pin.mapped_size;
 	seg->is_gpu_seg = true;
 
-	/*
-	 * TODO: 这里 put 之后就不再持有 provider 模块的引用计数，pin 期间
-	 * 理论上 udma_nv_p2p_bridge.ko（进而 nvidia.ko）可能被 rmmod
-	 * （已知简化，见文件头注释）。unpin 时重新 get 一次。
-	 */
+	dev_info(dev->dev,
+		 "[GPU-TRACE] pin OK provider=%s gpu_va=0x%llx mapped=0x%llx "
+		 "page_size=0x%x bus_off=0x%llx nents=%u first_pa=0x%llx\n",
+		 ops->name ? ops->name : "?",
+		 pin.gpu_va, pin.mapped_size, pin.page_size, pin.bus_offset,
+		 pin.sgt.nents, (uint64_t)sg_dma_address(pin.sgt.sgl));
+
 	udma_gpu_p2p_ops_put(ops);
 	return 0;
-
-#if UDMA_GPU_P2P_TEST_STOP_AFTER_SG
-err_free_sgt:
-	sg_free_table(&seg->umem->append.sgt);
-#endif
-err_free_umem:
-	kfree(seg->umem);
-	seg->umem = NULL;
-err_put_pages:
-	ops->put_pages(gpu_va, page_table);
-	udma_gpu_p2p_ops_put(ops);
-	return ret;
 }
 
-/*
- * GPU兼容测试补丁 — 环节 E 注销 pin
- * 与 udma_unpin_seg_pages() 中 GPU 分支配合
- * 入参 seg->gpu.gpu_va / seg->gpu.page_table 来自 pin 时保存
- */
 void udma_gpu_unpin_seg_pages(struct udma_segment *seg)
 {
+	const struct udma_gpu_p2p_ops *ops;
+	void *handle;
+	bool recycled;
+
 	if (!seg || !udma_seg_is_gpu(seg))
 		return;
 
-	if (seg->gpu.page_table) {
-		/*
-		 * force_freed==true 说明 free_callback 已经跑过一次，
-		 * page_table 在 NV 内部已经失效，不能再 put_pages。
-		 */
-		if (!seg->gpu.force_freed) {
-			const struct udma_gpu_p2p_ops *ops = udma_gpu_p2p_ops_get();
+	recycled = READ_ONCE(seg->gpu.force_freed);
+	handle = xchg(&seg->gpu.handle, NULL);
 
-			if (ops) {
-				ops->put_pages(seg->gpu.gpu_va, seg->gpu.page_table);
-				udma_gpu_p2p_ops_put(ops);
-			} else {
-				pr_err("UDMA: unpin GPU seg gpu_va=0x%llx but no GPU P2P "
-				       "provider registered (bridge unloaded?) — leaking pin\n",
-				       seg->gpu.gpu_va);
-			}
+	if (handle) {
+		ops = udma_gpu_p2p_ops_get_slot(seg->gpu.vendor);
+		if (ops) {
+			ops->unpin(handle, seg->gpu.gpu_va, recycled);
+			udma_gpu_p2p_ops_put(ops);
+		} else if (!recycled) {
+			pr_err("UDMA: unpin GPU seg gpu_va=0x%llx but no GPU P2P "
+			       "provider registered (bridge unloaded?) — leaking pin\n",
+			       seg->gpu.gpu_va);
 		}
-		seg->gpu.page_table = NULL;
 	}
 
 	if (seg->umem) {
@@ -448,5 +384,3 @@ void udma_gpu_unpin_seg_pages(struct udma_segment *seg)
 
 	seg->is_gpu_seg = false;
 }
-
-#endif /* UDMA_GPU_P2P_ENABLE */

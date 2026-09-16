@@ -366,9 +366,7 @@ static void udma_unpin_seg_pages(struct udma_segment *seg, bool dirty)
 		return;
 
 	/*
-	 * GPU兼容测试补丁 — 环节 E（注销 unpin）
-	 * GPU 段: udma_gpu_unpin_seg_pages → put_pages_persistent + sg_free
-	 * HOST 段: 原 udma_umem_release / put_user_page
+	 * GPU: vendor unpin + sg_free. HOST: umem_release / put_user_page.
 	 */
 	if (udma_seg_is_gpu(seg)) {
 		udma_gpu_unpin_seg_pages(seg);
@@ -605,14 +603,8 @@ static int udma_pin_pages_and_ioummu_map(struct ubcore_device *ub_dev, struct ud
 	/*
 	 * GPU兼容测试补丁 — 环节 4.2～7（sva_sep_mode 用户态注册主路径）
 	 *
-	 * 当 cfg->flag.value & UBCORE_REG_SEG_GPU_VA:
-	 *   环节 5  udma_gpu_pin_seg_pages(ub_dev, seg, cfg)
-	 *           不可使用 pin_user_pages（GPU VA 无 CPU VMA）
-	 *   环节 6  seg->tid = tid  （tid 来自 udma_register_seg 的 udma_tid->tid）
-	 *   环节 7a 非 LOCAL_ONLY: udma_ioummu_remote_map(tid, seg, prot)
-	 *           → udma_ioummu_map(INVALID_TID, r_tid=tid, prot, seg->addr, sgt)
-	 *           → ummu_sva_matt_map(..., cfg->va 对齐地址, sgt, prot)
-	 *   环节 7b udma_iommu_local_map → 本地 ctx->tid matt_map
+	 * GPU: vendor pin (MetaX acquire/get_mem or NVIDIA get_pages)
+	 *       → phys SG → matt_map_phys_sg. Never pin_user_pages.
 	 */
 	if (udma_seg_cfg_is_gpu(cfg)) {
 		ret = udma_gpu_pin_seg_pages(to_udma_dev(ub_dev), seg, cfg);

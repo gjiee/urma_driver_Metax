@@ -43,8 +43,9 @@ union ubcore_reg_seg_flag {
 ```
 用户态 seg_cfg.is_gpu_seg = 1（urma_seg_cfg_t 新增普通字段）
     ↓
-udma_u_register_seg(): 跳过 ummu_grant()；把 is_gpu_seg 打进
-                        struct udma_register_seg_ucmd，塞进 udata.in_addr
+udma_u_register_seg(): 仍做 ummu_grant（MAPT token/perm）；把 is_gpu_seg
+                        打进 struct udma_register_seg_ucmd，塞进 udata.in_addr
+                        （厂商选择是 udma.ko gpu_vendor=，不是 ucmd）
     ↓ urma_cmd_register_seg() → ioctl
               (arg.udata = udrv_data，arg.in.flag 完全不受影响)
 uburma_cmd_register_seg(): fill_udata() 把 arg.udata 挂到 struct ubcore_udata
@@ -89,17 +90,17 @@ udma_ioummu_remote_map / udma_iommu_local_map
 | `urma/hw/udma/udma_segment.h` | GPU 段结构体扩展（`is_gpu_seg`、`struct udma_gpu_p2p_mem gpu`） |
 | `urma/hw/udma/udma_segment.c` | `udma_register_seg()` 入口处从 `udata` 解析 GPU 标记并打到本地 `cfg`；`udma_init_seg_cfg` / `udma_pin_pages_and_ioummu_map` / legacy 路径 / `udma_unpin_seg_pages` 分流不变 |
 | `urma/hw/udma/udma_main.c` | 无 `MODULE_SOFTDEP`——`udma.ko` 不依赖 nvidia/bridge 就能加载 |
-| `urma/hw/udma/Makefile` | 编译 `udma.ko`（含 `udma_gpu_p2p.o`）**和** `udma_nv_p2p_bridge.ko` 两个 `obj-m` 目标，`ccflags -I$(NV_P2P_HEADER_PATH)` |
-| `urma/Makefile` | OOT 独立编译 `urma/` 支持（`NV_P2P_HEADER_PATH`/`NV_MODULE_SYMVERS`，只有 `udma_nv_p2p_bridge.ko` 需要） |
+| `urma/hw/udma/Makefile` | 编译 `udma.ko`（含 `udma_gpu_p2p.o`）；NVIDIA 有 `nv-p2p.h` 再编 NV bridge；沐曦有 `extra/Module.symvers` 再编 MetaX bridge |
+| `urma/Makefile` | OOT：NVIDIA 走实验室旁路树；沐曦走 `/lib/modules/$(uname -r)/extra/{metax.ko.xz,Module.symvers}`，无独立 `metax_p2p.h` |
 | `Makefile`（根） | OOT 整树编译支持 |
 
-对应 UMDK 用户态需要改的地方（不在本仓库）：
+对应 UMDK 用户态需要改的地方（不在本仓库，见 123toorc/UMDK）：
 
 | 文件 | 改动 |
 |------|------|
-| `urma_types.h` | `urma_seg_cfg_t` 新增普通字段 `uint32_t is_gpu_seg;` |
-| `udma_u_segment.c` | 定义与内核一致的 `struct udma_register_seg_ucmd`；GPU 时跳过 `ummu_grant`/`ummu_ungrant`；把 `is_gpu_seg` 打进 `ucmd`，通过 `urma_cmd_udrv_priv_t` 传给 `urma_cmd_register_seg()` |
-| `perftest_resources.c` | GPU 变种设置 `seg_cfg.is_gpu_seg = 1` + 64KB 对齐 |
+| `urma_types.h` | `urma_seg_cfg_t` 已有 `uint32_t is_gpu_seg;`。**不要**往 ucmd `reserved` 里塞 vendor：内核用 `udma.ko gpu_vendor=` 选卡 |
+| `udma_u_segment.c` | `struct udma_register_seg_ucmd { is_gpu_seg, reserved }` 与内核一致；`is_gpu_seg` 走 `udrv_data`。MAPT `ummu_grant` 对 GPU 段仍要做（只跳过 grant 会丢 token/perm） |
+| perftest | NVIDIA：`--gpu-mode=peermem` + 64KB 对齐。沐曦：`--gpu-mode=metax`（`mcMalloc`）+ `PAGE_SIZE` 对齐；加载 `udma.ko gpu_vendor=metax` |
 
 ---
 
@@ -232,11 +233,20 @@ make NV_P2P_HEADER_PATH=/path/to/nv-p2p-header-dir \
      NV_MODULE_SYMVERS=/path/to/your/nvidia/Module.symvers
 ```
 
-`urma/` 单独编译：
+`urma/` 单独编译。默认写死：
+
+```
+NVIDIA 头文件: ../nv_module_netlab/kernel-open/nvidia/nv-p2p.h
+沐曦 KMD 目录: /lib/modules/$(uname -r)/extra/
+               metax.ko.xz + Module.symvers
+```
 
 ```bash
 cd urma
-make NV_P2P_HEADER_PATH=... NV_MODULE_SYMVERS=...
+make
+make show-vars
+# extra/ 不在默认内核目录时：
+make METAX_KMOD_DIR=/lib/modules/$(uname -r)/extra
 ```
 
 加载顺序（三级，注意 `udma_nv_p2p_bridge.ko` 最后装）：
@@ -248,3 +258,66 @@ insmod urma/hw/udma/udma_nv_p2p_bridge.ko
 ```
 
 `udma_nv_p2p_bridge.ko` 已声明 `MODULE_SOFTDEP("pre: nvidia udma")`，`modprobe` 会自动处理前两个依赖；`insmod` 仍需手动按上面顺序。
+
+---
+
+## 6. GPU 注册 v3：厂商无关 pin + 沐曦 (MetaX) 适配
+
+NVIDIA `get_pages` → page_table 不是唯一的 GPU ABI。沐曦导出的是更干净的两段式接口：
+
+```c
+metax_p2p_acquire_mem(va, len, &handle, invalidate, arg);
+metax_p2p_get_mem(handle, &sgt);          /* 现成 sg_table */
+metax_p2p_put_mem(handle, sgt);
+metax_p2p_release_mem(handle);
+/* 另有 get_pci_dev / get_bus_offset / get_page_size */
+```
+
+和 NVIDIA 的关键差别：
+
+| | NVIDIA | MetaX |
+|---|---|---|
+| 对齐 | 64KB | `PAGE_SIZE`（acquire 内部再对齐） |
+| 页表形态 | `nvidia_p2p_page_table`，本地拼 SG | 驱动直接给 `sg_table` |
+| 失效回调 | `void (*)(void *)` | `int (*)(void *)`；recycle 后 **kfree handle** |
+| `pci_dev` / `bus_offset` | 无（给的就是 BAR PA） | 有。UB 不是 PCI 设备，**不用** `dma_map`；`bus_offset` 仅在 `apply_bus_offset=1` 时加到 PA 上 |
+
+`udma.ko` 不再认识任何厂商类型。契约在 `udma_gpu_p2p_ops.h`：
+
+```c
+int  (*pin)(va, len, invalidate, arg, struct udma_gpu_p2p_pin *out);
+void (*unpin)(handle, gpu_va, recycled);
+```
+
+`pin()` 必须交出 **UMMU 可用的 phys SG**（`sg_page=NULL`，`sg_dma_address=PA`）。
+
+```
+用户态 is_gpu_seg=1（udrv_data，不变）
+  → ubcore 原样校验
+  → udma_gpu_pin_seg_pages()
+       ops->pin()     // MetaX 或 NVIDIA bridge
+       接管 out.sgt
+  → ummu_sva_matt_map_phys_sg(gpu_va, sgt)
+```
+
+两个 bridge 可以同时加载。用 `udma.ko` 的模块参数选卡：
+
+```bash
+# 沐曦
+insmod metax.ko
+insmod udma.ko gpu_vendor=metax
+insmod udma_metax_p2p_bridge.ko
+
+# NVIDIA
+insmod nvidia.ko
+insmod udma.ko gpu_vendor=nvidia
+insmod udma_nv_p2p_bridge.ko
+
+# 运行中切换（已注册的段仍按 pin 时的厂商 unpin）
+echo metax  > /sys/module/udma/parameters/gpu_vendor
+echo nvidia > /sys/module/udma/parameters/gpu_vendor
+```
+
+`gpu_vendor` 取值：`auto`（默认，恰好一个 provider 时用它；两个都在必须显式选）、`metax`、`nvidia`（别名 `nv`）、`none`。
+
+没有 NVIDIA 头文件时 **不再** 把 `UDMA_GPU_P2P_ENABLE=0`：`udma.ko` 始终带 GPU pin，只是没装 bridge 时返回 `-ENODEV`。沐曦机器因此能编出和 NVIDIA 机器同一份 `udma.ko`。
