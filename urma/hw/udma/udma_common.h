@@ -75,6 +75,29 @@ struct udma_jetty_queue {
 	bool cstm;
 	bool dtu_en;
 	struct udma_dtu_pg_info dtu_pg_info;
+	/*
+	 * MXGDA: SQ buffer lives in GPU HBM.
+	 * Pinned via GPU P2P (vendor bridge) + UMMU MATT phys-SG mapping.
+	 * gpu_pin is allocated by udma_gpu_pin_sq_pages(), freed on teardown.
+	 */
+	bool is_gpu_seg;
+	struct udma_gpu_p2p_pin *gpu_pin;
+	uint32_t gpu_vendor;
+	/*
+	 * MXGDA: vendor invalidate 握手。
+	 * vendor 在应用提前释放 GPU 显存时回调 udma_gpu_sq_invalidate()，
+	 * 把 force_freed 置 true。unpin 时读它并传给 ops->unpin()，
+	 * 避免重复递减 vendor 侧引用计数（segment 路径同样机制）。
+	 */
+	bool gpu_force_freed;
+	/*
+	 * MXGDA: vendor 回收显存后，延迟撤销页表映射的 work。
+	 * invalidate 回调可能在原子上下文，iommu_unmap 会睡眠，
+	 * 因此必须异步执行。见 udma_gpu_sq_reclaim_work()。
+	 */
+	struct work_struct gpu_reclaim_work;
+	/* MXGDA: 页表映射是否已安装（bit0，防重入 unmap，保证只撤一次） */
+	unsigned long gpu_map_installed;
 };
 
 enum tp_state {
