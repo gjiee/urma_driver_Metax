@@ -67,15 +67,4 @@ int udma_gpu_pin_seg_pages(struct udma_dev *dev, struct udma_segment *seg,
 			   struct ubcore_seg_cfg *cfg);
 void udma_gpu_unpin_seg_pages(struct udma_segment *seg);
 
-/* ---- MXGDA: GPU-resident SQ (work queue) ---- */
-/* bit0 of udma_jetty_queue.gpu_map_installed */
-#define UDMA_SQ_MAP_INSTALLED_BIT	0
-/* forward decl: full definition lives in udma_common.h, which this header
- * cannot include (udma_common.h -> udma_dev.h -> ... -> udma_gpu_p2p.h). */
-struct udma_jetty_queue;
-int udma_gpu_pin_sq_pages(struct udma_dev *dev, struct udma_jetty_queue *sq);
-int udma_gpu_map_sq_pages(struct udma_dev *dev, struct udma_jetty_queue *sq);
-void udma_gpu_unmap_sq_pages(struct udma_jetty_queue *sq);
-void udma_gpu_unpin_sq_pages(struct udma_jetty_queue *sq);
-
 #endif /* __UDMA_GPU_P2P_H__ */

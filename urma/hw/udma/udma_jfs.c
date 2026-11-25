@@ -19,7 +19,6 @@
 #include "udma_segment.h"
 #include "udma_jfc.h"
 #include "udma_jfs.h"
-#include "udma_gpu_p2p.h"
 
 static bool udma_check_vma(struct udma_dev *dev, struct vm_area_struct *vma)
 {
@@ -62,21 +61,6 @@ static void udma_u_free_sq_buf(struct udma_dev *dev, struct udma_jetty_queue *sq
 
 void udma_free_sq_buf(struct udma_dev *dev, struct udma_jetty_queue *sq)
 {
-	/*
-	 * MXGDA: GPU SQ 清理必须先做，且不能受下面 "buf.kva 提前返回" 影响。
-	 *
-	 * 原实现第一条 if 会在 ccu jetty 或 buf.kva 非空时直接 return，
-	 * 若把 GPU 清理放在其后，任何触发该分支的路径都会跳过 unmap/unpin
-	 * —— 页表残留指向已释放显存，网卡 DMA 后整机挂死。
-	 */
-	if (sq->is_gpu_seg) {
-		/* 先取消挂起的 reclaim work，避免 work 在 sq 释放后仍访问它 */
-		cancel_work_sync(&sq->gpu_reclaim_work);
-		udma_gpu_unmap_sq_pages(sq);
-		udma_gpu_unpin_sq_pages(sq);
-		sq->is_gpu_seg = false;
-	}
-
 	if (is_support_ccu_jetty(dev, sq) || sq->buf.kva) {
 		if (!sq->cstm)
 			udma_k_free_buf(dev, &sq->buf, true);
@@ -251,34 +235,7 @@ int udma_alloc_u_sq_buf(struct udma_dev *dev, struct udma_jetty_queue *sq,
 	sq->buf.addr = ucmd->buf_addr;
 	sq->buf.len = ucmd->buf_len;
 	sq->dtu_en = ucmd->dtu_en;
-	sq->is_gpu_seg = ucmd->is_gpu_seg;
 	if (sq->non_pin) {
-		/*
-		 * MXGDA: SQ buffer in GPU HBM. Pin through the vendor bridge
-		 * and install a MATT phys-SG mapping, exactly like a GPU
-		 * segment. Must run BEFORE the sva_sep_mode_en check: in
-		 * separated SVA mode this path supplies the page table that
-		 * the generic non_pin path cannot.
-		 */
-		if (sq->is_gpu_seg) {
-			ret = udma_gpu_pin_sq_pages(dev, sq);
-			if (ret)
-				return ret;
-			/*
-			 * NOTE: 映射失败时只回滚 pin，不能走 unmap。
-			 * 也不会触发 vendor invalidate —— pin 是本进程刚做的，
-			 * vendor 还没机会 recycle。
-			 */
-			ret = udma_gpu_map_sq_pages(dev, sq);
-			if (ret) {
-				udma_gpu_unpin_sq_pages(sq);
-				return ret;
-			}
-			dev_info(dev->dev,
-				 "GPU SQ ready: va=0x%llx len=0x%llx sqe_bb_cnt=%u\n",
-				 sq->buf.addr, sq->buf.len, sq->sqe_bb_cnt);
-			return 0;
-		}
 		if (dev->caps.sva_sep_mode_en) {
 			dev_err(dev->dev, "separate mode not support non-pin.\n");
 			ret = -EINVAL;
@@ -522,7 +479,6 @@ static int udma_get_user_jfs_cmd(struct udma_dev *dev, struct udma_jfs *jfs,
 		jfs->jfs_addr = ucmd->jetty_addr;
 		jfs->sq.pi_type = ucmd->pi_type;
 		jfs->sq.non_pin = ucmd->non_pin;
-		jfs->sq.is_gpu_seg = ucmd->is_gpu_seg;
 		jfs->sq.jetty_type = (enum udma_jetty_type)ucmd->jetty_type;
 		jfs->sq.id = ucmd->jfs_id;
 	} else {
