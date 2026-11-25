@@ -399,6 +399,13 @@ static int udma_alloc_jetty_id_own(struct udma_dev *udma_dev, uint32_t *id,
 	case UDMA_NORMAL_JETTY_TYPE:
 		ret = udma_alloc_jetty_id(udma_dev, id,
 			&udma_dev->caps.user_ctrl_normal_jetty);
+		/* MXGDA: some MetaX devices report user_ctrl_normal_jetty as empty
+		 * (start=0,max=0). Fall back to the ordinary chain so that the
+		 * *_ex create path works there; non-empty devices keep the old
+		 * behaviour because the first attempt above already succeeds.
+		 */
+		if (ret)
+			ret = udma_alloc_normal_jetty_id(udma_dev, id);
 		break;
 	case UDMA_CCU_JETTY_TYPE:
 		ret = udma_alloc_jetty_id(udma_dev, id, &udma_dev->caps.ccu_jetty);
